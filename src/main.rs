@@ -491,7 +491,7 @@ async fn run_remote_mode(
     tracing::info!("Actor {} initialized and ready", party_index);
 
     tokio::spawn(async move {
-        for i in 0..10 {
+        for i in 0..100 {
             let query = [1u8; VECTOR_SIZE];
             let mut rng = rand::thread_rng();
             let shares = SecretSharedVector::create_shares(&query, &mut rng);
