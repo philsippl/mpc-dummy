@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use eyre::{Context, Ok};
+use eyre::{Context, ContextCompat, bail};
 use iris_mpc_common::galois::degree4::{GaloisRingElement, ShamirGaloisRingShare, basis};
 use iris_mpc_cpu::{
     execution::{
@@ -15,7 +15,7 @@ use iris_mpc_cpu::{
     shares::RingElement,
 };
 use itertools::Itertools;
-use rand::{CryptoRng, Rng};
+use rand::{CryptoRng, Rng, SeedableRng, rngs::StdRng};
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use std::{
@@ -26,9 +26,11 @@ use tokio::time::sleep;
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
 
-const MAX_DB_SIZE: usize = 10_000_000;
 const VECTOR_SIZE: usize = 512;
 const THRESHOLD: u16 = 1000;
+
+// Defaults, can be overridden via CLI args or env vars
+const MAX_DB_SIZE: usize = 10_000_000;
 const SESSION_PER_REQUEST: usize = 4;
 const CONNECTION_PARALLELISM: usize = 1;
 const REQUEST_PARALLELISM: usize = 1;
@@ -66,10 +68,66 @@ enum Mode {
 #[derive(Clone)]
 struct SecretSharedVector([u16; VECTOR_SIZE]);
 
+#[derive(Clone)]
+struct SessionPool {
+    inner: Arc<tokio::sync::Mutex<Vec<Session>>>,
+}
+
+impl SessionPool {
+    fn new(sessions: Vec<Session>) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(sessions)),
+        }
+    }
+
+    async fn checkout(&self) -> eyre::Result<SessionLease> {
+        let mut guard = self.inner.lock().await;
+        let session = guard.pop().context("No sessions available")?;
+        Ok(SessionLease {
+            pool: self.clone(),
+            session: Some(session),
+        })
+    }
+
+    async fn len(&self) -> usize {
+        self.inner.lock().await.len()
+    }
+
+    async fn checkin(&self, session: Session) {
+        self.inner.lock().await.push(session);
+    }
+}
+
+struct SessionLease {
+    pool: SessionPool,
+    session: Option<Session>,
+}
+
+impl SessionLease {
+    fn session_mut(&mut self) -> &mut Session {
+        self.session.as_mut().expect("session already returned")
+    }
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            let pool = self.pool.clone();
+            if let Ok(mut guard) = pool.inner.try_lock() {
+                guard.push(session);
+                return;
+            }
+            tokio::spawn(async move {
+                pool.checkin(session).await;
+            });
+        }
+    }
+}
+
 struct Network {
     _networking: Box<dyn NetworkHandle>,
     cancellation_token: CancellationToken,
-    sessions: Vec<Session>,
+    sessions: SessionPool,
 }
 
 enum ActorCommand {
@@ -216,7 +274,7 @@ impl Network {
         Ok(Self {
             _networking: networking, // Keep networking handle alive
             cancellation_token,
-            sessions,
+            sessions: SessionPool::new(sessions),
         })
     }
 }
@@ -256,50 +314,56 @@ impl Actor {
         let mut preprocessed_vector = vector.clone();
         preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
 
-        let num_workers = self.network.sessions.len();
-        let sessions = std::mem::take(&mut self.network.sessions);
+        let num_workers = self.network.sessions.len().await;
+        if num_workers == 0 {
+            bail!("No sessions available for comparison");
+        }
 
         let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(num_workers);
 
         let mut worker_handles = Vec::new();
 
-        for (worker_id, mut session) in sessions.into_iter().enumerate() {
+        for worker_id in 0..num_workers {
+            let lease = self.network.sessions.checkout().await?;
             let chunk_start = worker_id * self.db.len() / num_workers;
             let chunk_end = ((worker_id + 1) * self.db.len() / num_workers).min(self.db.len());
             let db = Arc::clone(&self.db);
-            let pre = preprocessed_vector.0;
             let result_tx = result_tx.clone();
 
             let handle = task::spawn(async move {
+                let mut lease = lease;
                 // Compute dot products for this chunk
                 let chunk_distances = task::spawn_blocking(move || {
                     db[chunk_start..chunk_end]
                         .par_iter()
-                        .map(|db_vec| udot(&pre, db_vec))
+                        .map(|db_vec| udot(&preprocessed_vector.0, db_vec))
                         .collect::<Vec<_>>()
                 })
                 .await?;
 
                 // Convert to replicated shares
                 let mut chunk_distances = galois_ring_to_rep3(
-                    &mut session,
+                    lease.session_mut(),
                     RingElement::convert_vec_rev(chunk_distances),
                 )
                 .await?;
 
                 // Subtract threshold
-                chunk_distances
-                    .iter_mut()
-                    .for_each(|share| sub_pub(&mut session, share, RingElement(THRESHOLD)));
+                {
+                    let session = lease.session_mut();
+                    chunk_distances
+                        .iter_mut()
+                        .for_each(|share| sub_pub(session, share, RingElement(THRESHOLD)));
+                }
 
                 // Network: Compare to zero and open results
                 let chunk_results =
-                    lte_threshold_and_open_u16(&mut session, &chunk_distances).await?;
+                    lte_threshold_and_open_u16(lease.session_mut(), &chunk_distances).await?;
 
                 // Send results back
                 let _ = result_tx.send((worker_id, chunk_results)).await;
 
-                eyre::Ok(session)
+                eyre::Ok(())
             });
             worker_handles.push(handle);
         }
@@ -311,10 +375,9 @@ impl Actor {
             chunk_results[worker_id] = results;
         }
 
-        // Wait for all workers to finish and restore sessions
+        // Wait for all workers to finish
         for handle in worker_handles {
-            let session = handle.await??;
-            self.network.sessions.push(session);
+            handle.await??;
         }
 
         let results = chunk_results.into_iter().flatten().collect_vec();
@@ -493,7 +556,7 @@ async fn run_remote_mode(
     tokio::spawn(async move {
         for i in 0..100 {
             let query = [1u8; VECTOR_SIZE];
-            let mut rng = rand::thread_rng();
+            let mut rng = StdRng::seed_from_u64(42);
             let shares = SecretSharedVector::create_shares(&query, &mut rng);
 
             // Send the share corresponding to this party's index
