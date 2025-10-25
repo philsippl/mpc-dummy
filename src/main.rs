@@ -28,7 +28,7 @@ use tokio::time::sleep;
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
 
-const MAX_DB_SIZE: usize = 100_000;
+const MAX_DB_SIZE: usize = 10_000;
 const VECTOR_SIZE: usize = 512;
 const THRESHOLD: u16 = 1000;
 const SESSION_PER_REQUEST: usize = 4;
@@ -49,7 +49,7 @@ enum ActorCommand {
 }
 
 struct Actor {
-    db: [[u16; VECTOR_SIZE]; MAX_DB_SIZE],
+    db: Arc<Vec<[u16; VECTOR_SIZE]>>,
     party_index: usize,
     network: Network,
     command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
@@ -205,7 +205,7 @@ impl Actor {
         sessions_per_request: usize,
     ) -> eyre::Result<Self> {
         println!("Initializing actor {}", party_index);
-        let db = [[1u16; VECTOR_SIZE]; MAX_DB_SIZE];
+        let db = Arc::new(vec![[1u16; VECTOR_SIZE]; MAX_DB_SIZE]);
         println!("Database initialized for actor {}", party_index);
         let network = Network::new(
             party_index,
@@ -271,7 +271,7 @@ impl Actor {
 
         // Compute dot products against database
         let dot_now = Instant::now();
-        let db = Arc::new(self.db);
+        let db = Arc::clone(&self.db);
         let pre = preprocessed_vector.0;
         let distances =
             task::spawn_blocking(move || db.par_iter().map(|db_vec| udot(&pre, db_vec)).collect())
@@ -293,9 +293,9 @@ impl Actor {
 
         // Log results
         tracing::info!(
-            "Actor {} comparison results: {:?}",
+            "Actor {} comparison results[0]: {:?}",
             self.party_index,
-            results
+            results[0]
         );
 
         tracing::info!(
