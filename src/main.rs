@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use eyre::{Context, Ok};
 use iris_mpc_common::galois::degree4::{GaloisRingElement, ShamirGaloisRingShare, basis};
 use iris_mpc_cpu::{
@@ -20,13 +18,22 @@ use iris_mpc_cpu::{
 };
 use itertools::Itertools;
 use rand::{CryptoRng, Rng};
-use tokio::sync::mpsc;
+use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::ParallelIterator;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::time::sleep;
+use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
 
-const MAX_DB_SIZE: usize = 10;
+const MAX_DB_SIZE: usize = 100_000;
 const VECTOR_SIZE: usize = 512;
 const THRESHOLD: u16 = 1000;
+const SESSION_PER_REQUEST: usize = 4;
+const CONNECTION_PARALLELISM: usize = 1;
+const REQUEST_PARALLELISM: usize = 1;
 
 #[derive(Clone)]
 struct SecretSharedVector([u16; VECTOR_SIZE]);
@@ -106,7 +113,13 @@ impl SecretSharedVector {
 }
 
 impl Network {
-    async fn new(party_index: usize, addresses: Vec<String>) -> eyre::Result<Network> {
+    async fn new(
+        party_index: usize,
+        addresses: Vec<String>,
+        connection_parallelism: usize,
+        request_parallelism: usize,
+        sessions_per_request: usize,
+    ) -> eyre::Result<Network> {
         let identities = generate_local_identities();
         let role_assignments: RoleAssignment = identities
             .iter()
@@ -119,8 +132,8 @@ impl Network {
         let args = HawkArgs {
             party_index: party_index,
             addresses: addresses,
-            request_parallelism: 1,
-            connection_parallelism: 1,
+            request_parallelism,
+            connection_parallelism,
             hnsw_param_M: 0,
             hnsw_param_ef_search: 0,
             hnsw_param_ef_constr: 0,
@@ -135,8 +148,13 @@ impl Network {
         let cancellation_token = CancellationToken::new();
 
         // TODO: encapsulate networking setup in a function
-        let mut networking =
-            build_network_handle(&args, cancellation_token.child_token(), &identities, 8).await?;
+        let mut networking = build_network_handle(
+            &args,
+            cancellation_token.child_token(),
+            &identities,
+            sessions_per_request,
+        )
+        .await?;
 
         let tcp_sessions = networking
             .as_mut()
@@ -167,6 +185,8 @@ impl Network {
         }
         tracing::info!("Networking sessions established.");
 
+        tracing::info!("Number of sessions available {}", sessions.len());
+
         Ok(Self {
             _networking: networking, // Keep networking handle alive
             cancellation_token,
@@ -180,9 +200,21 @@ impl Actor {
         party_index: usize,
         addresses: Vec<String>,
         command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
+        connection_parallelism: usize,
+        request_parallelism: usize,
+        sessions_per_request: usize,
     ) -> eyre::Result<Self> {
+        println!("Initializing actor {}", party_index);
         let db = [[1u16; VECTOR_SIZE]; MAX_DB_SIZE];
-        let network = Network::new(party_index, addresses.clone()).await?;
+        println!("Database initialized for actor {}", party_index);
+        let network = Network::new(
+            party_index,
+            addresses.clone(),
+            connection_parallelism,
+            request_parallelism,
+            sessions_per_request,
+        )
+        .await?;
         Ok(Self {
             db,
             party_index,
@@ -232,15 +264,20 @@ impl Actor {
         tracing::info!("Running comparison for actor {}", self.party_index);
         let session = &mut self.network.sessions[0];
 
+        let now = Instant::now();
+
         let mut preprocessed_vector = vector.clone();
         preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
 
-        // Compute dot products against the database
-        let distances = self
-            .db
-            .iter()
-            .map(|db_vector| udot(&preprocessed_vector.0, db_vector))
-            .collect_vec();
+        // Compute dot products against database
+        let dot_now = Instant::now();
+        let db = Arc::new(self.db);
+        let pre = preprocessed_vector.0;
+        let distances =
+            task::spawn_blocking(move || db.par_iter().map(|db_vec| udot(&pre, db_vec)).collect())
+                .await?;
+
+        let dots_per_second = self.db.len() as f64 / dot_now.elapsed().as_secs_f64();
 
         // Convert results to replicated shares
         let mut distances =
@@ -254,10 +291,25 @@ impl Actor {
         // Compare to zero and open results
         let results = lte_threshold_and_open_u16(session, &distances).await?;
 
+        // Log results
         tracing::info!(
             "Actor {} comparison results: {:?}",
             self.party_index,
             results
+        );
+
+        tracing::info!(
+            "Actor {} computed {} dot products in {:?} ({} dots/s)",
+            self.party_index,
+            self.db.len(),
+            dot_now.elapsed(),
+            dots_per_second
+        );
+
+        tracing::info!(
+            "Actor {} comparison completed in {:?}",
+            self.party_index,
+            now.elapsed()
         );
 
         Ok(())
@@ -295,12 +347,24 @@ async fn main() -> eyre::Result<()> {
     let mut handles = Vec::new();
     let mut senders = Vec::new();
 
+    println!("Starting actors...");
+
     for i in 0..3 {
         let addresses = addresses.clone();
         let (sender, receiver) = mpsc::unbounded_channel();
         senders.push(sender);
         handles.push(tokio::spawn(async move {
-            Actor::new(i, addresses, receiver).await?.run().await
+            Actor::new(
+                i,
+                addresses,
+                receiver,
+                CONNECTION_PARALLELISM,
+                REQUEST_PARALLELISM,
+                SESSION_PER_REQUEST,
+            )
+            .await?
+            .run()
+            .await
         }));
     }
 

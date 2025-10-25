@@ -2985,6 +2985,7 @@ dependencies = [
  "iris-mpc-cpu",
  "itertools 0.14.0",
  "rand 0.8.5",
+ "rayon",
  "tokio",
  "tokio-util",
  "tracing",
