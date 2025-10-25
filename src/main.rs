@@ -333,7 +333,7 @@ impl Actor {
             bail!("No sessions available for comparison");
         }
 
-        // Phase 1: CPU computation - single par_iter over entire DB
+        // Phase 1
         let db = Arc::clone(&self.db);
         let all_distances = task::spawn_blocking(move || {
             db.par_iter()
@@ -351,7 +351,7 @@ impl Actor {
 
         let now2 = Instant::now();
 
-        // Phase 2: Network operations - distribute to workers
+        // Phase 2
         let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(num_network_workers);
 
         let mut worker_handles = Vec::new();
