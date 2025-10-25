@@ -343,10 +343,13 @@ impl Actor {
         .await?;
 
         tracing::debug!(
-            "Actor {} completed CPU phase: {} distances computed",
+            "Actor {} completed CPU phase: {} distances computed in {:?}",
             self.party_index,
-            all_distances.len()
+            all_distances.len(),
+            now.elapsed()
         );
+
+        let now2 = Instant::now();
 
         // Phase 2: Network operations - distribute to workers
         let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(num_network_workers);
@@ -356,7 +359,8 @@ impl Actor {
         for worker_id in 0..num_network_workers {
             let lease = self.network.sessions.checkout().await?;
             let chunk_start = worker_id * all_distances.len() / num_network_workers;
-            let chunk_end = ((worker_id + 1) * all_distances.len() / num_network_workers).min(all_distances.len());
+            let chunk_end = ((worker_id + 1) * all_distances.len() / num_network_workers)
+                .min(all_distances.len());
             let chunk_distances = all_distances[chunk_start..chunk_end].to_vec();
             let result_tx = result_tx.clone();
 
@@ -414,6 +418,12 @@ impl Actor {
         // Calculate running average
         let total_elapsed = self.first_request_time.unwrap().elapsed();
         let running_avg_comp_per_sec = self.total_comparisons as f64 / total_elapsed.as_secs_f64();
+
+        tracing::info!(
+            "Actor {} network phase completed in {:?}",
+            self.party_index,
+            now2.elapsed()
+        );
 
         // Log results
         tracing::info!(
