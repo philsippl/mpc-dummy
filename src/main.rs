@@ -140,6 +140,10 @@ struct Actor {
     party_index: usize,
     network: Network,
     command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
+    // Running statistics
+    total_comparisons: usize,
+    total_requests: usize,
+    first_request_time: Option<Instant>,
 }
 
 fn udot(a: &[u16], b: &[u16]) -> u16 {
@@ -310,6 +314,9 @@ impl Actor {
             party_index,
             network,
             command_receiver,
+            total_comparisons: 0,
+            total_requests: 0,
+            first_request_time: None,
         })
     }
 
@@ -397,6 +404,17 @@ impl Actor {
 
         let results = chunk_results.into_iter().flatten().collect_vec();
 
+        // Update running statistics
+        if self.first_request_time.is_none() {
+            self.first_request_time = Some(now);
+        }
+        self.total_comparisons += results.len();
+        self.total_requests += 1;
+
+        // Calculate running average
+        let total_elapsed = self.first_request_time.unwrap().elapsed();
+        let running_avg_comp_per_sec = self.total_comparisons as f64 / total_elapsed.as_secs_f64();
+
         // Log results
         tracing::info!(
             "Actor {} comparison results[0]: {:?} (len: {})",
@@ -410,6 +428,15 @@ impl Actor {
             self.party_index,
             now.elapsed(),
             (results.len() as f64) / now.elapsed().as_secs_f64() / 1e6
+        );
+
+        tracing::info!(
+            "Actor {} running average: {:.2}M comp/s (total: {} comparisons, {} requests, {:?} elapsed)",
+            self.party_index,
+            running_avg_comp_per_sec / 1e6,
+            self.total_comparisons,
+            self.total_requests,
+            total_elapsed
         );
 
         if results.len() != self.db.len() {
