@@ -333,76 +333,102 @@ impl Actor {
             bail!("No sessions available for comparison");
         }
 
-        // Phase 1: CPU computation - single par_iter over entire DB
-        let db = Arc::clone(&self.db);
-        let all_distances = task::spawn_blocking(move || {
-            db.par_iter()
-                .map(|db_vec| udot(&preprocessed_vector.0, db_vec))
-                .collect::<Vec<_>>()
-        })
-        .await?;
-
-        tracing::info!(
-            "Actor {} completed CPU phase: {} distances computed in {:?}",
-            self.party_index,
-            all_distances.len(),
-            now.elapsed()
-        );
-
-        let now2 = Instant::now();
-
-        // Phase 2: Network operations - distribute to workers
+        // Pipeline: CPU produces chunks -> Network workers consume chunks
+        // Create one channel per network worker for work distribution
+        let mut cpu_senders = Vec::new();
         let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(num_network_workers);
 
-        let mut worker_handles = Vec::new();
-
+        // Spawn network workers, each with its own receiver
+        let mut network_handles = Vec::new();
         for worker_id in 0..num_network_workers {
             let lease = self.network.sessions.checkout().await?;
-            let chunk_start = worker_id * all_distances.len() / num_network_workers;
-            let chunk_end = ((worker_id + 1) * all_distances.len() / num_network_workers)
-                .min(all_distances.len());
-            let chunk_distances = all_distances[chunk_start..chunk_end].to_vec();
+            let (tx, mut rx) = mpsc::channel::<Vec<u16>>(1); // Buffer size of 1 for backpressure
+            cpu_senders.push(tx);
             let result_tx = result_tx.clone();
 
             let handle = task::spawn(async move {
                 let mut lease = lease;
 
-                // Convert to replicated shares
-                let mut chunk_distances = galois_ring_to_rep3(
-                    lease.session_mut(),
-                    RingElement::convert_vec_rev(chunk_distances),
-                )
-                .await?;
+                // Process chunks as they arrive from CPU
+                while let Some(chunk_distances) = rx.recv().await {
+                    // Convert to replicated shares
+                    let mut chunk_distances = galois_ring_to_rep3(
+                        lease.session_mut(),
+                        RingElement::convert_vec_rev(chunk_distances),
+                    )
+                    .await?;
 
-                // Subtract threshold
-                {
-                    let session = lease.session_mut();
-                    chunk_distances
-                        .iter_mut()
-                        .for_each(|share| sub_pub(session, share, RingElement(THRESHOLD)));
+                    // Subtract threshold
+                    {
+                        let session = lease.session_mut();
+                        chunk_distances
+                            .iter_mut()
+                            .for_each(|share| sub_pub(session, share, RingElement(THRESHOLD)));
+                    }
+
+                    // Network: Compare to zero and open results
+                    let chunk_results =
+                        lte_threshold_and_open_u16(lease.session_mut(), &chunk_distances).await?;
+
+                    // Send results back
+                    let _ = result_tx.send((worker_id, chunk_results)).await;
                 }
-
-                // Network: Compare to zero and open results
-                let chunk_results =
-                    lte_threshold_and_open_u16(lease.session_mut(), &chunk_distances).await?;
-
-                // Send results back
-                let _ = result_tx.send((worker_id, chunk_results)).await;
 
                 eyre::Ok(())
             });
-            worker_handles.push(handle);
+            network_handles.push(handle);
         }
+
+        // Drop result_tx so result_rx knows when all workers are done
         drop(result_tx);
 
-        // Collect results from workers
+        // Spawn CPU task that chunks DB and computes distances
+        let db = Arc::clone(&self.db);
+        let db_len = db.len();
+        let cpu_handle = task::spawn_blocking(move || {
+            let chunk_size = (db_len + num_network_workers - 1) / num_network_workers;
+
+            for chunk_id in 0..num_network_workers {
+                let chunk_start = chunk_id * chunk_size;
+                let chunk_end = ((chunk_id + 1) * chunk_size).min(db_len);
+
+                if chunk_start >= db_len {
+                    break;
+                }
+
+                // Compute distances for this chunk using par_iter
+                let chunk_distances: Vec<u16> = db[chunk_start..chunk_end]
+                    .par_iter()
+                    .map(|db_vec| udot(&preprocessed_vector.0, db_vec))
+                    .collect();
+
+                // Send to corresponding network worker (blocks if channel is full - backpressure)
+                if cpu_senders[chunk_id].blocking_send(chunk_distances).is_err() {
+                    break; // Channel closed, stop processing
+                }
+            }
+            // Channels will be dropped here, signaling completion to network workers
+        });
+
+        // Wait for CPU task to complete
+        cpu_handle.await?;
+
+        tracing::info!(
+            "Actor {} completed CPU phase in {:?}",
+            self.party_index,
+            now.elapsed()
+        );
+
+        let network_start = Instant::now();
+
+        // Collect results from network workers
         let mut chunk_results = vec![Vec::new(); num_network_workers];
-        while let Some((worker_id, results)) = result_rx.recv().await {
-            chunk_results[worker_id] = results;
+        while let Some((chunk_id, results)) = result_rx.recv().await {
+            chunk_results[chunk_id] = results;
         }
 
-        // Wait for all workers to finish
-        for handle in worker_handles {
+        // Wait for all network workers to finish
+        for handle in network_handles {
             handle.await??;
         }
 
@@ -422,7 +448,7 @@ impl Actor {
         tracing::info!(
             "Actor {} network phase completed in {:?}",
             self.party_index,
-            now2.elapsed()
+            network_start.elapsed()
         );
 
         // Log results
