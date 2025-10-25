@@ -140,6 +140,10 @@ struct Actor {
     party_index: usize,
     network: Network,
     command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
+    // Running statistics
+    total_comparisons: usize,
+    total_requests: usize,
+    first_request_time: Option<Instant>,
 }
 
 fn udot(a: &[u16], b: &[u16]) -> u16 {
@@ -310,6 +314,9 @@ impl Actor {
             party_index,
             network,
             command_receiver,
+            total_comparisons: 0,
+            total_requests: 0,
+            first_request_time: None,
         })
     }
 
@@ -321,32 +328,44 @@ impl Actor {
         let mut preprocessed_vector = vector.clone();
         preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
 
-        let num_workers = min(self.network.sessions.len().await, num_cpus::get_physical());
-        if num_workers == 0 {
+        let num_network_workers = min(self.network.sessions.len().await, num_cpus::get_physical());
+        if num_network_workers == 0 {
             bail!("No sessions available for comparison");
         }
 
-        let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(num_workers);
+        // Phase 1
+        let db = Arc::clone(&self.db);
+        let all_distances = task::spawn_blocking(move || {
+            db.par_iter()
+                .map(|db_vec| udot(&preprocessed_vector.0, db_vec))
+                .collect::<Vec<_>>()
+        })
+        .await?;
+
+        tracing::info!(
+            "Actor {} completed CPU phase: {} distances computed in {:?}",
+            self.party_index,
+            all_distances.len(),
+            now.elapsed()
+        );
+
+        let now2 = Instant::now();
+
+        // Phase 2
+        let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(num_network_workers);
 
         let mut worker_handles = Vec::new();
 
-        for worker_id in 0..num_workers {
+        for worker_id in 0..num_network_workers {
             let lease = self.network.sessions.checkout().await?;
-            let chunk_start = worker_id * self.db.len() / num_workers;
-            let chunk_end = ((worker_id + 1) * self.db.len() / num_workers).min(self.db.len());
-            let db = Arc::clone(&self.db);
+            let chunk_start = worker_id * all_distances.len() / num_network_workers;
+            let chunk_end = ((worker_id + 1) * all_distances.len() / num_network_workers)
+                .min(all_distances.len());
+            let chunk_distances = all_distances[chunk_start..chunk_end].to_vec();
             let result_tx = result_tx.clone();
 
             let handle = task::spawn(async move {
                 let mut lease = lease;
-                // Compute dot products for this chunk
-                let chunk_distances = task::spawn_blocking(move || {
-                    db[chunk_start..chunk_end]
-                        .par_iter()
-                        .map(|db_vec| udot(&preprocessed_vector.0, db_vec))
-                        .collect::<Vec<_>>()
-                })
-                .await?;
 
                 // Convert to replicated shares
                 let mut chunk_distances = galois_ring_to_rep3(
@@ -377,7 +396,7 @@ impl Actor {
         drop(result_tx);
 
         // Collect results from workers
-        let mut chunk_results = vec![Vec::new(); num_workers];
+        let mut chunk_results = vec![Vec::new(); num_network_workers];
         while let Some((worker_id, results)) = result_rx.recv().await {
             chunk_results[worker_id] = results;
         }
@@ -388,6 +407,23 @@ impl Actor {
         }
 
         let results = chunk_results.into_iter().flatten().collect_vec();
+
+        // Update running statistics
+        if self.first_request_time.is_none() {
+            self.first_request_time = Some(now);
+        }
+        self.total_comparisons += results.len();
+        self.total_requests += 1;
+
+        // Calculate running average
+        let total_elapsed = self.first_request_time.unwrap().elapsed();
+        let running_avg_comp_per_sec = self.total_comparisons as f64 / total_elapsed.as_secs_f64();
+
+        tracing::info!(
+            "Actor {} network phase completed in {:?}",
+            self.party_index,
+            now2.elapsed()
+        );
 
         // Log results
         tracing::info!(
@@ -402,6 +438,15 @@ impl Actor {
             self.party_index,
             now.elapsed(),
             (results.len() as f64) / now.elapsed().as_secs_f64() / 1e6
+        );
+
+        tracing::info!(
+            "Actor {} running average: {:.2}M comp/s (total: {} comparisons, {} requests, {:?} elapsed)",
+            self.party_index,
+            running_avg_comp_per_sec / 1e6,
+            self.total_comparisons,
+            self.total_requests,
+            total_elapsed
         );
 
         if results.len() != self.db.len() {
