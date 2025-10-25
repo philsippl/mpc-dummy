@@ -19,6 +19,7 @@ use rand::{CryptoRng, Rng, SeedableRng, rngs::StdRng};
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use std::{
+    cmp::min,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -271,6 +272,12 @@ impl Network {
         }
         tracing::info!("Networking sessions established.");
 
+        tracing::info!(
+            "Established {} sessions for party {}",
+            sessions.len(),
+            party_index
+        );
+
         Ok(Self {
             _networking: networking, // Keep networking handle alive
             cancellation_token,
@@ -314,7 +321,7 @@ impl Actor {
         let mut preprocessed_vector = vector.clone();
         preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
 
-        let num_workers = self.network.sessions.len().await;
+        let num_workers = min(self.network.sessions.len().await, num_cpus::get_physical());
         if num_workers == 0 {
             bail!("No sessions available for comparison");
         }
