@@ -321,32 +321,40 @@ impl Actor {
         let mut preprocessed_vector = vector.clone();
         preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
 
-        let num_workers = min(self.network.sessions.len().await, num_cpus::get_physical());
-        if num_workers == 0 {
+        let num_network_workers = min(self.network.sessions.len().await, num_cpus::get_physical());
+        if num_network_workers == 0 {
             bail!("No sessions available for comparison");
         }
 
-        let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(num_workers);
+        // Phase 1: CPU computation - single par_iter over entire DB
+        let db = Arc::clone(&self.db);
+        let all_distances = task::spawn_blocking(move || {
+            db.par_iter()
+                .map(|db_vec| udot(&preprocessed_vector.0, db_vec))
+                .collect::<Vec<_>>()
+        })
+        .await?;
+
+        tracing::debug!(
+            "Actor {} completed CPU phase: {} distances computed",
+            self.party_index,
+            all_distances.len()
+        );
+
+        // Phase 2: Network operations - distribute to workers
+        let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(num_network_workers);
 
         let mut worker_handles = Vec::new();
 
-        for worker_id in 0..num_workers {
+        for worker_id in 0..num_network_workers {
             let lease = self.network.sessions.checkout().await?;
-            let chunk_start = worker_id * self.db.len() / num_workers;
-            let chunk_end = ((worker_id + 1) * self.db.len() / num_workers).min(self.db.len());
-            let db = Arc::clone(&self.db);
+            let chunk_start = worker_id * all_distances.len() / num_network_workers;
+            let chunk_end = ((worker_id + 1) * all_distances.len() / num_network_workers).min(all_distances.len());
+            let chunk_distances = all_distances[chunk_start..chunk_end].to_vec();
             let result_tx = result_tx.clone();
 
             let handle = task::spawn(async move {
                 let mut lease = lease;
-                // Compute dot products for this chunk
-                let chunk_distances = task::spawn_blocking(move || {
-                    db[chunk_start..chunk_end]
-                        .par_iter()
-                        .map(|db_vec| udot(&preprocessed_vector.0, db_vec))
-                        .collect::<Vec<_>>()
-                })
-                .await?;
 
                 // Convert to replicated shares
                 let mut chunk_distances = galois_ring_to_rep3(
@@ -377,7 +385,7 @@ impl Actor {
         drop(result_tx);
 
         // Collect results from workers
-        let mut chunk_results = vec![Vec::new(); num_workers];
+        let mut chunk_results = vec![Vec::new(); num_network_workers];
         while let Some((worker_id, results)) = result_rx.recv().await {
             chunk_results[worker_id] = results;
         }
