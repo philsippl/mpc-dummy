@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
-use eyre::{Context, ContextCompat, bail};
+use deadpool::unmanaged::Pool;
+use eyre::{Context, bail};
 use iris_mpc_common::galois::degree4::{GaloisRingElement, ShamirGaloisRingShare, basis};
 use iris_mpc_cpu::{
     execution::{
@@ -69,61 +70,7 @@ enum Mode {
 #[derive(Clone)]
 struct SecretSharedVector([u16; VECTOR_SIZE]);
 
-#[derive(Clone)]
-struct SessionPool {
-    inner: Arc<tokio::sync::Mutex<Vec<Session>>>,
-}
-
-impl SessionPool {
-    fn new(sessions: Vec<Session>) -> Self {
-        Self {
-            inner: Arc::new(tokio::sync::Mutex::new(sessions)),
-        }
-    }
-
-    async fn checkout(&self) -> eyre::Result<SessionLease> {
-        let mut guard = self.inner.lock().await;
-        let session = guard.pop().context("No sessions available")?;
-        Ok(SessionLease {
-            pool: self.clone(),
-            session: Some(session),
-        })
-    }
-
-    async fn len(&self) -> usize {
-        self.inner.lock().await.len()
-    }
-
-    async fn checkin(&self, session: Session) {
-        self.inner.lock().await.push(session);
-    }
-}
-
-struct SessionLease {
-    pool: SessionPool,
-    session: Option<Session>,
-}
-
-impl SessionLease {
-    fn session_mut(&mut self) -> &mut Session {
-        self.session.as_mut().expect("session already returned")
-    }
-}
-
-impl Drop for SessionLease {
-    fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            let pool = self.pool.clone();
-            if let Ok(mut guard) = pool.inner.try_lock() {
-                guard.push(session);
-                return;
-            }
-            tokio::spawn(async move {
-                pool.checkin(session).await;
-            });
-        }
-    }
-}
+type SessionPool = Pool<Session>;
 
 struct Network {
     _networking: Box<dyn NetworkHandle>,
@@ -282,10 +229,13 @@ impl Network {
             party_index
         );
 
+        // Create unmanaged deadpool with pre-created sessions
+        let pool = Pool::from(sessions);
+
         Ok(Self {
             _networking: networking, // Keep networking handle alive
             cancellation_token,
-            sessions: SessionPool::new(sessions),
+            sessions: pool,
         })
     }
 }
@@ -328,7 +278,7 @@ impl Actor {
         let mut preprocessed_vector = vector.clone();
         preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
 
-        let num_network_workers = min(self.network.sessions.len().await, num_cpus::get_physical());
+        let num_network_workers = min(self.network.sessions.status().size, num_cpus::get_physical());
         if num_network_workers == 0 {
             bail!("No sessions available for comparison");
         }
@@ -357,7 +307,7 @@ impl Actor {
         let mut worker_handles = Vec::new();
 
         for worker_id in 0..num_network_workers {
-            let lease = self.network.sessions.checkout().await?;
+            let mut session = self.network.sessions.get().await?;
             let chunk_start = worker_id * all_distances.len() / num_network_workers;
             let chunk_end = ((worker_id + 1) * all_distances.len() / num_network_workers)
                 .min(all_distances.len());
@@ -365,26 +315,21 @@ impl Actor {
             let result_tx = result_tx.clone();
 
             let handle = task::spawn(async move {
-                let mut lease = lease;
-
                 // Convert to replicated shares
                 let mut chunk_distances = galois_ring_to_rep3(
-                    lease.session_mut(),
+                    &mut *session,
                     RingElement::convert_vec_rev(chunk_distances),
                 )
                 .await?;
 
                 // Subtract threshold
-                {
-                    let session = lease.session_mut();
-                    chunk_distances
-                        .iter_mut()
-                        .for_each(|share| sub_pub(session, share, RingElement(THRESHOLD)));
-                }
+                chunk_distances
+                    .iter_mut()
+                    .for_each(|share| sub_pub(&mut *session, share, RingElement(THRESHOLD)));
 
                 // Network: Compare to zero and open results
                 let chunk_results =
-                    lte_threshold_and_open_u16(lease.session_mut(), &chunk_distances).await?;
+                    lte_threshold_and_open_u16(&mut *session, &chunk_distances).await?;
 
                 // Send results back
                 let _ = result_tx.send((worker_id, chunk_results)).await;
