@@ -2980,6 +2980,8 @@ dependencies = [
 name = "mpc-dummy"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "dotenvy",
  "eyre",
  "iris-mpc-common",
  "iris-mpc-cpu",

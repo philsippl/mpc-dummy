@@ -1,3 +1,4 @@
+use clap::{Parser, Subcommand};
 use eyre::{Context, Ok};
 use iris_mpc_common::galois::degree4::{GaloisRingElement, ShamirGaloisRingShare, basis};
 use iris_mpc_cpu::{
@@ -31,6 +32,36 @@ const THRESHOLD: u16 = 1000;
 const SESSION_PER_REQUEST: usize = 4;
 const CONNECTION_PARALLELISM: usize = 1;
 const REQUEST_PARALLELISM: usize = 1;
+
+#[derive(Parser, Debug)]
+struct Cli {
+    #[command(subcommand)]
+    mode: Mode,
+
+    #[arg(long, env = "MAX_DB", default_value_t = MAX_DB_SIZE)]
+    max_db: usize,
+
+    #[arg(long, env = "SESSION_PER_REQUEST", default_value_t = SESSION_PER_REQUEST)]
+    session_per_request: usize,
+
+    #[arg(long, env = "CONNECTION_PARALLELISM", default_value_t = CONNECTION_PARALLELISM)]
+    connection_parallelism: usize,
+
+    #[arg(long, env = "REQUEST_PARALLELISM", default_value_t = REQUEST_PARALLELISM)]
+    request_parallelism: usize,
+}
+
+#[derive(Subcommand, Debug)]
+enum Mode {
+    Local,
+    Remote {
+        #[arg(short, long, env = "PARTY_INDEX")]
+        party_index: usize,
+
+        #[arg(short, long, env = "ADDRESSES", value_delimiter = ',')]
+        addresses: Vec<String>,
+    },
+}
 
 #[derive(Clone)]
 struct SecretSharedVector([u16; VECTOR_SIZE]);
@@ -198,10 +229,9 @@ impl Actor {
         connection_parallelism: usize,
         request_parallelism: usize,
         sessions_per_request: usize,
+        max_db: usize,
     ) -> eyre::Result<Self> {
-        println!("Initializing actor {}", party_index);
-        let db = Arc::new(vec![[1u16; VECTOR_SIZE]; MAX_DB_SIZE]);
-        println!("Database initialized for actor {}", party_index);
+        let db = Arc::new(vec![[1u16; VECTOR_SIZE]; max_db]);
         let network = Network::new(
             party_index,
             addresses.clone(),
@@ -241,7 +271,7 @@ impl Actor {
             let result_tx = result_tx.clone();
 
             let handle = task::spawn(async move {
-                // CPU: Compute dot products for this chunk
+                // Compute dot products for this chunk
                 let chunk_distances = task::spawn_blocking(move || {
                     db[chunk_start..chunk_end]
                         .par_iter()
@@ -250,7 +280,7 @@ impl Actor {
                 })
                 .await?;
 
-                // Network: Convert to replicated shares
+                // Convert to replicated shares
                 let mut chunk_distances = galois_ring_to_rep3(
                     &mut session,
                     RingElement::convert_vec_rev(chunk_distances),
@@ -326,7 +356,53 @@ impl Actor {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt::init();
+
+    let cli = Cli::parse();
+
+    match cli.mode {
+        Mode::Local => {
+            run_local_mode(
+                cli.max_db,
+                cli.connection_parallelism,
+                cli.request_parallelism,
+                cli.session_per_request,
+            )
+            .await
+        }
+        Mode::Remote {
+            party_index,
+            addresses,
+        } => {
+            run_remote_mode(
+                party_index,
+                addresses,
+                cli.max_db,
+                cli.connection_parallelism,
+                cli.request_parallelism,
+                cli.session_per_request,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_local_mode(
+    max_db: usize,
+    connection_parallelism: usize,
+    request_parallelism: usize,
+    session_per_request: usize,
+) -> eyre::Result<()> {
+    tracing::info!("Running in LOCAL mode (all actors on this machine)");
+    tracing::info!(
+        "Config: max_db={}, connection_parallelism={}, request_parallelism={}, session_per_request={}",
+        max_db,
+        connection_parallelism,
+        request_parallelism,
+        session_per_request
+    );
 
     let addresses = vec![
         "127.0.0.1:7001".to_string(),
@@ -337,7 +413,7 @@ async fn main() -> eyre::Result<()> {
     let mut handles = Vec::new();
     let mut senders = Vec::new();
 
-    println!("Starting actors...");
+    tracing::info!("Starting actors...");
 
     for i in 0..3 {
         let addresses = addresses.clone();
@@ -348,9 +424,10 @@ async fn main() -> eyre::Result<()> {
                 i,
                 addresses,
                 receiver,
-                CONNECTION_PARALLELISM,
-                REQUEST_PARALLELISM,
-                SESSION_PER_REQUEST,
+                connection_parallelism,
+                request_parallelism,
+                session_per_request,
+                max_db,
             )
             .await?
             .run()
@@ -374,6 +451,64 @@ async fn main() -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_remote_mode(
+    party_index: usize,
+    addresses: Vec<String>,
+    max_db: usize,
+    connection_parallelism: usize,
+    request_parallelism: usize,
+    session_per_request: usize,
+) -> eyre::Result<()> {
+    tracing::info!(
+        "Running in REMOTE mode (party {} of {})",
+        party_index,
+        addresses.len()
+    );
+    tracing::info!("Addresses: {:?}", addresses);
+    tracing::info!(
+        "Config: max_db={}, connection_parallelism={}, request_parallelism={}, session_per_request={}",
+        max_db,
+        connection_parallelism,
+        request_parallelism,
+        session_per_request
+    );
+
+    let (sender, receiver) = mpsc::unbounded_channel();
+
+    let mut actor = Actor::new(
+        party_index,
+        addresses,
+        receiver,
+        connection_parallelism,
+        request_parallelism,
+        session_per_request,
+        max_db,
+    )
+    .await?;
+
+    tracing::info!("Actor {} initialized and ready", party_index);
+
+    tokio::spawn(async move {
+        for i in 0..10 {
+            let query = [1u8; VECTOR_SIZE];
+            let mut rng = rand::thread_rng();
+            let shares = SecretSharedVector::create_shares(&query, &mut rng);
+
+            // Send the share corresponding to this party's index
+            if let Err(e) = sender.send(ActorCommand::Comparison(shares[party_index].clone())) {
+                tracing::error!("Failed to send comparison command {}: {}", i, e);
+                break;
+            }
+            tracing::info!("Sent comparison request {} to actor {}", i + 1, party_index);
+        }
+    });
+
+    tracing::info!("Waiting for network connections and processing commands...");
+
+    // Run the actor (it will process commands from the channel)
+    actor.run().await
 }
 
 #[cfg(test)]
