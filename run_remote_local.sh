@@ -36,19 +36,19 @@ echo -e "${GREEN}Starting 3 MPC actors in remote mode...${NC}"
 
 # Start actor 0
 echo -e "${BLUE}Starting Actor 0 (port 7001)...${NC}"
-PARTY_INDEX=0 cargo run --quiet -- remote &
+PARTY_INDEX=0 cargo run -- remote &
 PIDS+=($!)
 sleep 1
 
 # Start actor 1
 echo -e "${BLUE}Starting Actor 1 (port 7002)...${NC}"
-PARTY_INDEX=1 cargo run --quiet -- remote &
+PARTY_INDEX=1 cargo run -- remote &
 PIDS+=($!)
 sleep 1
 
 # Start actor 2
 echo -e "${BLUE}Starting Actor 2 (port 7003)...${NC}"
-PARTY_INDEX=2 cargo run --quiet -- remote &
+PARTY_INDEX=2 cargo run -- remote &
 PIDS+=($!)
 sleep 1
 

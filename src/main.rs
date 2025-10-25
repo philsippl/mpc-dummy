@@ -397,6 +397,20 @@ impl Actor {
             (results.len() as f64) / now.elapsed().as_secs_f64() / 1e6
         );
 
+        if results.len() != self.db.len() {
+            panic!(
+                "Result length mismatch: expected {}, got {}",
+                self.db.len(),
+                results.len()
+            );
+        }
+
+        if results.iter().any(|&r| r == false) {
+            panic!(
+                "Some comparisons resulted in false, which is unexpected given the database and query values."
+            );
+        }
+
         Ok(())
     }
 
