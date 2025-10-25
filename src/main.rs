@@ -342,7 +342,7 @@ impl Actor {
         })
         .await?;
 
-        tracing::debug!(
+        tracing::info!(
             "Actor {} completed CPU phase: {} distances computed in {:?}",
             self.party_index,
             all_distances.len(),
