@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use eyre::{Context, Ok};
+use eyre::{Context, Ok, eyre};
 use iris_mpc_cpu::{
     execution::{
         hawk_main::HawkArgs,
@@ -12,16 +12,20 @@ use iris_mpc_cpu::{
         tcp::{NetworkHandle, build_network_handle},
         value::NetworkValue,
     },
-    protocol::ops::setup_replicated_prf,
+    protocol::ops::{
+        galois_ring_to_rep3, lte_threshold_and_open_u16, setup_replicated_prf, sub_pub,
+    },
     shares::RingElement,
 };
 use itertools::Itertools;
 use rand::Rng;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 const MAX_DB_SIZE: usize = 10;
 const VECTOR_SIZE: usize = 512;
+const THRESHOLD: u16 = 1000;
 
 struct Network {
     networking: Box<dyn NetworkHandle>,
@@ -29,10 +33,22 @@ struct Network {
     sessions: Vec<Session>,
 }
 
+enum ActorCommand {
+    Comparison([u16; VECTOR_SIZE]),
+}
+
 struct Actor {
     db: [[u16; VECTOR_SIZE]; MAX_DB_SIZE],
     party_index: usize,
     network: Network,
+    command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
+}
+
+fn udot16(a: &[u16], b: &[u16]) -> u16 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&a, &b)| u16::wrapping_mul(a, b))
+        .fold(0_u16, u16::wrapping_add)
 }
 
 impl Network {
@@ -106,13 +122,18 @@ impl Network {
 }
 
 impl Actor {
-    async fn new(party_index: usize, addresses: Vec<String>) -> eyre::Result<Self> {
+    async fn new(
+        party_index: usize,
+        addresses: Vec<String>,
+        command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
+    ) -> eyre::Result<Self> {
         let db = [[0u16; VECTOR_SIZE]; MAX_DB_SIZE];
         let network = Network::new(party_index, addresses.clone()).await?;
         Ok(Self {
             db,
             party_index,
             network,
+            command_receiver,
         })
     }
 
@@ -153,8 +174,45 @@ impl Actor {
         Ok(())
     }
 
+    async fn run_comparison(&mut self, vector: [u16; VECTOR_SIZE]) -> eyre::Result<()> {
+        tracing::info!("Running comparison for actor {}", self.party_index);
+        let session = &mut self.network.sessions[0];
+
+        let distances = self
+            .db
+            .iter()
+            .map(|db_vector| udot16(&vector, db_vector))
+            .collect_vec();
+
+        let distances =
+            galois_ring_to_rep3(session, RingElement::convert_slice_rev(&distances).to_vec())
+                .await?;
+
+        let mut share = distances[0].clone();
+        sub_pub(session, &mut share, RingElement(THRESHOLD));
+
+        let results = lte_threshold_and_open_u16(session, &[share]).await?;
+
+        tracing::info!(
+            "Actor {} comparison results: {:?}",
+            self.party_index,
+            results
+        );
+
+        Ok(())
+    }
+
     async fn run(&mut self) -> eyre::Result<()> {
         self.connection_test().await?;
+
+        while let Some(command) = self.command_receiver.recv().await {
+            match command {
+                ActorCommand::Comparison(vector) => {
+                    tracing::info!("Actor {} received command", self.party_index);
+                    self.run_comparison(vector).await?;
+                }
+            }
+        }
 
         sleep(Duration::from_secs(5)).await;
         self.network.cancellation_token.cancel();
@@ -173,12 +231,21 @@ async fn main() -> eyre::Result<()> {
         "127.0.0.1:7003".to_string(),
     ];
 
-    let handles: Vec<_> = (0..3)
-        .map(|i| {
-            let addresses = addresses.clone();
-            tokio::spawn(async move { Actor::new(i, addresses).await?.run().await })
-        })
-        .collect();
+    let mut handles = Vec::new();
+    let mut senders = Vec::new();
+
+    for i in 0..3 {
+        let addresses = addresses.clone();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        senders.push(sender);
+        handles.push(tokio::spawn(async move {
+            Actor::new(i, addresses, receiver).await?.run().await
+        }));
+    }
+
+    for (index, sender) in senders.iter().enumerate() {
+        sender.send(ActorCommand::Comparison([index as u16; VECTOR_SIZE]))?;
+    }
 
     for handle in handles {
         handle.await??;
