@@ -1,6 +1,7 @@
-use std::time::Duration;
+use std::{default, time::Duration};
 
 use eyre::{Context, Ok, eyre};
+use iris_mpc_common::galois::degree4::{GaloisRingElement, ShamirGaloisRingShare, basis};
 use iris_mpc_cpu::{
     execution::{
         hawk_main::HawkArgs,
@@ -18,7 +19,7 @@ use iris_mpc_cpu::{
     shares::RingElement,
 };
 use itertools::Itertools;
-use rand::Rng;
+use rand::{CryptoRng, Rng};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +27,8 @@ use tokio_util::sync::CancellationToken;
 const MAX_DB_SIZE: usize = 10;
 const VECTOR_SIZE: usize = 512;
 const THRESHOLD: u16 = 1000;
+
+struct SecretSharedVector([u16; VECTOR_SIZE]);
 
 struct Network {
     networking: Box<dyn NetworkHandle>,
@@ -44,11 +47,65 @@ struct Actor {
     command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
 }
 
-fn udot16(a: &[u16], b: &[u16]) -> u16 {
+fn udot(a: &[u16], b: &[u16]) -> u16 {
     a.iter()
         .zip(b.iter())
         .map(|(&a, &b)| u16::wrapping_mul(a, b))
         .fold(0_u16, u16::wrapping_add)
+}
+
+impl SecretSharedVector {
+    fn default() -> Self {
+        SecretSharedVector([0u16; VECTOR_SIZE])
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn create_shares<R: CryptoRng + Rng>(vector: &[u8; VECTOR_SIZE], rng: &mut R) -> [Self; 3] {
+        let mut shares = [
+            SecretSharedVector::default(),
+            SecretSharedVector::default(),
+            SecretSharedVector::default(),
+        ];
+        for i in (0..VECTOR_SIZE).step_by(4) {
+            let element = GaloisRingElement::<basis::A>::from_coefs([
+                vector[i] as u16,
+                vector[i + 1] as u16,
+                vector[i + 2] as u16,
+                vector[i + 3] as u16,
+            ]);
+            let element = element.to_monomial();
+            let share = ShamirGaloisRingShare::encode_3_mat(&element.coefs, rng);
+            for j in 0..3 {
+                shares[j].0[i] = share[j].y.coefs[0];
+                shares[j].0[i + 1] = share[j].y.coefs[1];
+                shares[j].0[i + 2] = share[j].y.coefs[2];
+                shares[j].0[i + 3] = share[j].y.coefs[3];
+            }
+        }
+        shares
+    }
+
+    pub fn multiply_lagrange_coeffs(&mut self, id: usize) {
+        let lagrange_coeffs = ShamirGaloisRingShare::deg_2_lagrange_polys_at_zero();
+        for i in (0..self.0.len()).step_by(4) {
+            let element = GaloisRingElement::<basis::Monomial>::from_coefs([
+                self.0[i],
+                self.0[i + 1],
+                self.0[i + 2],
+                self.0[i + 3],
+            ]);
+            // include lagrange coeffs
+            let element: GaloisRingElement<basis::Monomial> = element * lagrange_coeffs[id - 1];
+            let element = element.to_basis_B();
+            self.0[i] = element.coefs[0];
+            self.0[i + 1] = element.coefs[1];
+            self.0[i + 2] = element.coefs[2];
+            self.0[i + 3] = element.coefs[3];
+        }
+    }
 }
 
 impl Network {
@@ -181,7 +238,7 @@ impl Actor {
         let distances = self
             .db
             .iter()
-            .map(|db_vector| udot16(&vector, db_vector))
+            .map(|db_vector| udot(&vector, db_vector))
             .collect_vec();
 
         let distances =
@@ -252,4 +309,35 @@ async fn main() -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{SecretSharedVector, VECTOR_SIZE, udot};
+
+    fn udot_u8(a: &[u8], b: &[u8]) -> u16 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&a, &b)| u16::wrapping_mul(a as u16, b as u16))
+            .fold(0_u16, u16::wrapping_add)
+    }
+
+    #[tokio::test]
+    async fn test_galois_dot() {
+        let v1 = [1u8; VECTOR_SIZE];
+        let v2 = [2u8; VECTOR_SIZE];
+
+        let dot_ref = udot_u8(&v1, &v2);
+
+        let mut sv1 = SecretSharedVector::create_shares(&v1, &mut rand::thread_rng());
+        let sv2 = SecretSharedVector::create_shares(&v2, &mut rand::thread_rng());
+
+        let mut dot: u16 = 0;
+        for i in 0..3 {
+            sv1[i].multiply_lagrange_coeffs(i + 1);
+            dot = u16::wrapping_add(dot, udot(&sv1[i].0, &sv2[i].0));
+        }
+
+        assert_eq!(dot, dot_ref);
+    }
 }
