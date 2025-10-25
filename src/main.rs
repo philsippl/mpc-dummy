@@ -1,6 +1,6 @@
-use std::{default, time::Duration};
+use std::time::Duration;
 
-use eyre::{Context, Ok, eyre};
+use eyre::{Context, Ok};
 use iris_mpc_common::galois::degree4::{GaloisRingElement, ShamirGaloisRingShare, basis};
 use iris_mpc_cpu::{
     execution::{
@@ -28,16 +28,17 @@ const MAX_DB_SIZE: usize = 10;
 const VECTOR_SIZE: usize = 512;
 const THRESHOLD: u16 = 1000;
 
+#[derive(Clone)]
 struct SecretSharedVector([u16; VECTOR_SIZE]);
 
 struct Network {
-    networking: Box<dyn NetworkHandle>,
+    _networking: Box<dyn NetworkHandle>,
     cancellation_token: CancellationToken,
     sessions: Vec<Session>,
 }
 
 enum ActorCommand {
-    Comparison([u16; VECTOR_SIZE]),
+    Comparison(SecretSharedVector),
 }
 
 struct Actor {
@@ -57,10 +58,6 @@ fn udot(a: &[u16], b: &[u16]) -> u16 {
 impl SecretSharedVector {
     fn default() -> Self {
         SecretSharedVector([0u16; VECTOR_SIZE])
-    }
-
-    fn len(&self) -> usize {
-        self.0.len()
     }
 
     pub fn create_shares<R: CryptoRng + Rng>(vector: &[u8; VECTOR_SIZE], rng: &mut R) -> [Self; 3] {
@@ -171,7 +168,7 @@ impl Network {
         tracing::info!("Networking sessions established.");
 
         Ok(Self {
-            networking,
+            _networking: networking, // Keep networking handle alive
             cancellation_token,
             sessions,
         })
@@ -184,7 +181,7 @@ impl Actor {
         addresses: Vec<String>,
         command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
     ) -> eyre::Result<Self> {
-        let db = [[0u16; VECTOR_SIZE]; MAX_DB_SIZE];
+        let db = [[1u16; VECTOR_SIZE]; MAX_DB_SIZE];
         let network = Network::new(party_index, addresses.clone()).await?;
         Ok(Self {
             db,
@@ -231,24 +228,31 @@ impl Actor {
         Ok(())
     }
 
-    async fn run_comparison(&mut self, vector: [u16; VECTOR_SIZE]) -> eyre::Result<()> {
+    async fn run_comparison(&mut self, vector: SecretSharedVector) -> eyre::Result<()> {
         tracing::info!("Running comparison for actor {}", self.party_index);
         let session = &mut self.network.sessions[0];
 
+        let mut preprocessed_vector = vector.clone();
+        preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
+
+        // Compute dot products against the database
         let distances = self
             .db
             .iter()
-            .map(|db_vector| udot(&vector, db_vector))
+            .map(|db_vector| udot(&preprocessed_vector.0, db_vector))
             .collect_vec();
 
-        let distances =
-            galois_ring_to_rep3(session, RingElement::convert_slice_rev(&distances).to_vec())
-                .await?;
+        // Convert results to replicated shares
+        let mut distances =
+            galois_ring_to_rep3(session, RingElement::convert_vec_rev(distances)).await?;
 
-        let mut share = distances[0].clone();
-        sub_pub(session, &mut share, RingElement(THRESHOLD));
+        // Subtract threshold
+        distances
+            .iter_mut()
+            .for_each(|share| sub_pub(session, share, RingElement(THRESHOLD)));
 
-        let results = lte_threshold_and_open_u16(session, &[share]).await?;
+        // Compare to zero and open results
+        let results = lte_threshold_and_open_u16(session, &distances).await?;
 
         tracing::info!(
             "Actor {} comparison results: {:?}",
@@ -300,8 +304,13 @@ async fn main() -> eyre::Result<()> {
         }));
     }
 
+    // Actors are running now, send them commands
+    let query = [1u8; VECTOR_SIZE];
+    let mut rng = rand::thread_rng();
+    let shares = SecretSharedVector::create_shares(&query, &mut rng);
+
     for (index, sender) in senders.iter().enumerate() {
-        sender.send(ActorCommand::Comparison([index as u16; VECTOR_SIZE]))?;
+        sender.send(ActorCommand::Comparison(shares[index].clone()))?;
     }
 
     for handle in handles {

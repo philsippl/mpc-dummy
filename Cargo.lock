@@ -2505,7 +2505,7 @@ dependencies = [
 [[package]]
 name = "iris-mpc-common"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=b8d4570#b8d45701c8ba844016f2d9d89ef2f0300b30bde2"
+source = "git+https://github.com/worldcoin/iris-mpc.git?rev=f4ba8e0#f4ba8e00da36f0deba5b965ef9ff8dec9b7db217"
 dependencies = [
  "aws-config",
  "aws-sdk-kms",
@@ -2560,7 +2560,7 @@ dependencies = [
 [[package]]
 name = "iris-mpc-cpu"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=b8d4570#b8d45701c8ba844016f2d9d89ef2f0300b30bde2"
+source = "git+https://github.com/worldcoin/iris-mpc.git?rev=f4ba8e0#f4ba8e00da36f0deba5b965ef9ff8dec9b7db217"
 dependencies = [
  "aes-prng",
  "ansiterm",
@@ -2619,7 +2619,7 @@ dependencies = [
 [[package]]
 name = "iris-mpc-store"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=b8d4570#b8d45701c8ba844016f2d9d89ef2f0300b30bde2"
+source = "git+https://github.com/worldcoin/iris-mpc.git?rev=f4ba8e0#f4ba8e00da36f0deba5b965ef9ff8dec9b7db217"
 dependencies = [
  "async-trait",
  "aws-config",
