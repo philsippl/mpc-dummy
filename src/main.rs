@@ -7,10 +7,7 @@ use iris_mpc_cpu::{
         player::{Role, RoleAssignment},
         session::{NetworkSession, Session},
     },
-    network::{
-        tcp::{NetworkHandle, build_network_handle},
-        value::NetworkValue,
-    },
+    network::tcp::{NetworkHandle, build_network_handle},
     protocol::ops::{
         galois_ring_to_rep3, lte_threshold_and_open_u16, setup_replicated_prf, sub_pub,
     },
@@ -28,7 +25,7 @@ use tokio::time::sleep;
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
 
-const MAX_DB_SIZE: usize = 10_000;
+const MAX_DB_SIZE: usize = 10_000_000;
 const VECTOR_SIZE: usize = 512;
 const THRESHOLD: u16 = 1000;
 const SESSION_PER_REQUEST: usize = 4;
@@ -185,8 +182,6 @@ impl Network {
         }
         tracing::info!("Networking sessions established.");
 
-        tracing::info!("Number of sessions available {}", sessions.len());
-
         Ok(Self {
             _networking: networking, // Keep networking handle alive
             cancellation_token,
@@ -223,101 +218,96 @@ impl Actor {
         })
     }
 
-    async fn connection_test(&mut self) -> eyre::Result<()> {
-        let session = &mut self.network.sessions[0];
-        session
-            .network_session
-            .send_next(NetworkValue::RingElement16(RingElement(
-                self.party_index as u16,
-            )))
-            .await?;
-        session
-            .network_session
-            .send_prev(NetworkValue::RingElement16(RingElement(
-                self.party_index as u16,
-            )))
-            .await?;
-        let next_response = session.network_session.receive_next().await?;
-        if let NetworkValue::RingElement16(x) = next_response {
-            if x.0 as usize != ((self.party_index + 1) % 3) {
-                tracing::error!("Incorrect prev response value: {:?}", x);
-            }
-            tracing::info!("Received next response: {:?}", x);
-        } else {
-            tracing::error!("Unexpected response type for next_response");
-        }
-        let prev_response = session.network_session.receive_prev().await?;
-        if let NetworkValue::RingElement16(x) = prev_response {
-            if x.0 as usize != ((self.party_index + 2) % 3) {
-                tracing::error!("Incorrect prev response value: {:?}", x);
-            }
-            tracing::info!("Received prev response: {:?}", x);
-        } else {
-            tracing::error!("Unexpected response type for prev_response");
-        }
-        tracing::info!("Anon stats server networking test complete.");
-
-        Ok(())
-    }
-
     async fn run_comparison(&mut self, vector: SecretSharedVector) -> eyre::Result<()> {
         tracing::info!("Running comparison for actor {}", self.party_index);
-        let session = &mut self.network.sessions[0];
 
         let now = Instant::now();
 
         let mut preprocessed_vector = vector.clone();
         preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
 
-        // Compute dot products against database
-        let dot_now = Instant::now();
-        let db = Arc::clone(&self.db);
-        let pre = preprocessed_vector.0;
-        let distances =
-            task::spawn_blocking(move || db.par_iter().map(|db_vec| udot(&pre, db_vec)).collect())
+        let num_workers = self.network.sessions.len();
+        let sessions = std::mem::take(&mut self.network.sessions);
+
+        let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(num_workers);
+
+        let mut worker_handles = Vec::new();
+
+        for (worker_id, mut session) in sessions.into_iter().enumerate() {
+            let chunk_start = worker_id * self.db.len() / num_workers;
+            let chunk_end = ((worker_id + 1) * self.db.len() / num_workers).min(self.db.len());
+            let db = Arc::clone(&self.db);
+            let pre = preprocessed_vector.0;
+            let result_tx = result_tx.clone();
+
+            let handle = task::spawn(async move {
+                // CPU: Compute dot products for this chunk
+                let chunk_distances = task::spawn_blocking(move || {
+                    db[chunk_start..chunk_end]
+                        .par_iter()
+                        .map(|db_vec| udot(&pre, db_vec))
+                        .collect::<Vec<_>>()
+                })
                 .await?;
 
-        let dots_per_second = self.db.len() as f64 / dot_now.elapsed().as_secs_f64();
+                // Network: Convert to replicated shares
+                let mut chunk_distances = galois_ring_to_rep3(
+                    &mut session,
+                    RingElement::convert_vec_rev(chunk_distances),
+                )
+                .await?;
 
-        // Convert results to replicated shares
-        let mut distances =
-            galois_ring_to_rep3(session, RingElement::convert_vec_rev(distances)).await?;
+                // Subtract threshold
+                chunk_distances
+                    .iter_mut()
+                    .for_each(|share| sub_pub(&mut session, share, RingElement(THRESHOLD)));
 
-        // Subtract threshold
-        distances
-            .iter_mut()
-            .for_each(|share| sub_pub(session, share, RingElement(THRESHOLD)));
+                // Network: Compare to zero and open results
+                let chunk_results =
+                    lte_threshold_and_open_u16(&mut session, &chunk_distances).await?;
 
-        // Compare to zero and open results
-        let results = lte_threshold_and_open_u16(session, &distances).await?;
+                // Send results back
+                let _ = result_tx.send((worker_id, chunk_results)).await;
+
+                eyre::Ok(session)
+            });
+            worker_handles.push(handle);
+        }
+        drop(result_tx);
+
+        // Collect results from workers
+        let mut chunk_results = vec![Vec::new(); num_workers];
+        while let Some((worker_id, results)) = result_rx.recv().await {
+            chunk_results[worker_id] = results;
+        }
+
+        // Wait for all workers to finish and restore sessions
+        for handle in worker_handles {
+            let session = handle.await??;
+            self.network.sessions.push(session);
+        }
+
+        let results = chunk_results.into_iter().flatten().collect_vec();
 
         // Log results
         tracing::info!(
-            "Actor {} comparison results[0]: {:?}",
+            "Actor {} comparison results[0]: {:?} (len: {})",
             self.party_index,
-            results[0]
+            results[0],
+            results.len()
         );
 
         tracing::info!(
-            "Actor {} computed {} dot products in {:?} ({} dots/s)",
+            "Actor {} comparison completed in {:?} ({:.2}M comp/s)",
             self.party_index,
-            self.db.len(),
-            dot_now.elapsed(),
-            dots_per_second
-        );
-
-        tracing::info!(
-            "Actor {} comparison completed in {:?}",
-            self.party_index,
-            now.elapsed()
+            now.elapsed(),
+            (results.len() as f64) / now.elapsed().as_secs_f64() / 1e6
         );
 
         Ok(())
     }
 
     async fn run(&mut self) -> eyre::Result<()> {
-        self.connection_test().await?;
-
         while let Some(command) = self.command_receiver.recv().await {
             match command {
                 ActorCommand::Comparison(vector) => {
@@ -369,12 +359,14 @@ async fn main() -> eyre::Result<()> {
     }
 
     // Actors are running now, send them commands
-    let query = [1u8; VECTOR_SIZE];
-    let mut rng = rand::thread_rng();
-    let shares = SecretSharedVector::create_shares(&query, &mut rng);
+    for _ in 0..10 {
+        let query = [1u8; VECTOR_SIZE];
+        let mut rng = rand::thread_rng();
+        let shares = SecretSharedVector::create_shares(&query, &mut rng);
 
-    for (index, sender) in senders.iter().enumerate() {
-        sender.send(ActorCommand::Comparison(shares[index].clone()))?;
+        for (index, sender) in senders.iter().enumerate() {
+            sender.send(ActorCommand::Comparison(shares[index].clone()))?;
+        }
     }
 
     for handle in handles {
