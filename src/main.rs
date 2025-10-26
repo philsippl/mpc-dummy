@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use deadpool::unmanaged::Pool;
 use eyre::{Context, bail};
 use hdrhistogram::Histogram;
@@ -41,8 +41,11 @@ const REQUEST_PARALLELISM: usize = 1;
 
 #[derive(Parser, Debug)]
 struct Cli {
-    #[command(subcommand)]
-    mode: Mode,
+    #[arg(short, long, env = "PARTY_INDEX")]
+    party_index: usize,
+
+    #[arg(short, long, env = "ADDRESSES", value_delimiter = ',')]
+    addresses: Vec<String>,
 
     #[arg(long, env = "MAX_DB", default_value_t = MAX_DB_SIZE)]
     max_db: usize,
@@ -55,18 +58,6 @@ struct Cli {
 
     #[arg(long, env = "REQUEST_PARALLELISM", default_value_t = REQUEST_PARALLELISM)]
     request_parallelism: usize,
-}
-
-#[derive(Subcommand, Debug)]
-enum Mode {
-    Local,
-    Remote {
-        #[arg(short, long, env = "PARTY_INDEX")]
-        party_index: usize,
-
-        #[arg(short, long, env = "ADDRESSES", value_delimiter = ',')]
-        addresses: Vec<String>,
-    },
 }
 
 #[derive(Clone)]
@@ -169,8 +160,8 @@ impl Network {
 
         // abuse the hawk args struct for now
         let args = HawkArgs {
-            party_index: party_index,
-            addresses: addresses,
+            party_index,
+            addresses,
             request_parallelism,
             connection_parallelism,
             hnsw_param_M: 0,
@@ -298,36 +289,23 @@ impl Actor {
 
         let db = Arc::clone(&self.db);
         let db_len = db.len();
-        let target_chunks = max(1, num_network_workers * 4);
-        let chunk_size = max(1, (db_len + target_chunks - 1) / target_chunks);
-
-        let mut chunk_bounds = Vec::new();
-        let mut offset = 0usize;
-        while offset < db_len {
-            let end = min(offset + chunk_size, db_len);
-            chunk_bounds.push((offset, end));
-            offset = end;
-        }
-
-        let chunk_count = chunk_bounds.len();
-        if chunk_count == 0 {
+        if db_len == 0 {
             return Ok(());
         }
 
+        let chunk_size = max(1, db_len.div_ceil(num_network_workers * 4));
+        let chunk_bounds = (0..db_len)
+            .step_by(chunk_size)
+            .map(|start| (start, min(start + chunk_size, db_len)))
+            .collect_vec();
         let chunk_count = chunk_bounds.len();
-        if chunk_count == 0 {
-            return Ok(());
-        }
 
         let worker_count = min(num_network_workers, chunk_count);
         let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(chunk_count);
         let mut worker_senders = Vec::with_capacity(worker_count);
         let mut network_handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            let (worker_tx, mut worker_rx) = mpsc::channel::<(usize, Vec<u16>)>(max(
-                1,
-                (chunk_count + worker_count - 1) / worker_count,
-            ));
+            let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<(usize, Vec<u16>)>();
             worker_senders.push(worker_tx);
             let result_tx = result_tx.clone();
             let mut session = self.network.sessions.get().await?;
@@ -344,10 +322,7 @@ impl Actor {
                     let chunk_results =
                         lte_threshold_and_open_u16(&mut session, &chunk_distances).await?;
 
-                    result_tx
-                        .send((chunk_id, chunk_results))
-                        .await
-                        .context("Network stage failed to send chunk result")?;
+                    result_tx.send((chunk_id, chunk_results)).await?;
                 }
                 eyre::Result::<()>::Ok(())
             }));
@@ -368,9 +343,7 @@ impl Actor {
                         .collect::<Vec<_>>();
                     (chunk_id, distances)
                 });
-                let result = handle
-                    .await
-                    .context("CPU worker join error within blocking task")?;
+                let result = handle.await?;
                 eyre::Result::<_>::Ok(result)
             });
         }
@@ -393,7 +366,6 @@ impl Actor {
                     let sender = worker_senders[worker_idx].clone();
                     sender
                         .send((chunk_id, distances))
-                        .await
                         .context("Failed to dispatch chunk to network worker")?;
                     expected_chunks[worker_idx] += worker_count;
                 }
@@ -425,6 +397,7 @@ impl Actor {
             (results.len() as f64) / (total_us as f64 / 1e6) / 1e6
         );
 
+        // Sanity check
         if results.len() != self.db.len() {
             panic!(
                 "Result length mismatch: expected {}, got {}",
@@ -470,98 +443,18 @@ async fn main() -> eyre::Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.mode {
-        Mode::Local => {
-            run_local_mode(
-                cli.max_db,
-                cli.connection_parallelism,
-                cli.request_parallelism,
-                cli.session_per_request,
-            )
-            .await
-        }
-        Mode::Remote {
-            party_index,
-            addresses,
-        } => {
-            run_remote_mode(
-                party_index,
-                addresses,
-                cli.max_db,
-                cli.connection_parallelism,
-                cli.request_parallelism,
-                cli.session_per_request,
-            )
-            .await
-        }
-    }
+    run(
+        cli.party_index,
+        cli.addresses,
+        cli.max_db,
+        cli.connection_parallelism,
+        cli.request_parallelism,
+        cli.session_per_request,
+    )
+    .await
 }
 
-async fn run_local_mode(
-    max_db: usize,
-    connection_parallelism: usize,
-    request_parallelism: usize,
-    session_per_request: usize,
-) -> eyre::Result<()> {
-    tracing::info!("Running in LOCAL mode (all actors on this machine)");
-    tracing::info!(
-        "Config: max_db={}, connection_parallelism={}, request_parallelism={}, session_per_request={}",
-        max_db,
-        connection_parallelism,
-        request_parallelism,
-        session_per_request
-    );
-
-    let addresses = vec![
-        "127.0.0.1:7001".to_string(),
-        "127.0.0.1:7002".to_string(),
-        "127.0.0.1:7003".to_string(),
-    ];
-
-    let mut handles = Vec::new();
-    let mut senders = Vec::new();
-
-    tracing::info!("Starting actors...");
-
-    for i in 0..3 {
-        let addresses = addresses.clone();
-        let (sender, receiver) = mpsc::unbounded_channel();
-        senders.push(sender);
-        handles.push(tokio::spawn(async move {
-            Actor::new(
-                i,
-                addresses,
-                receiver,
-                connection_parallelism,
-                request_parallelism,
-                session_per_request,
-                max_db,
-            )
-            .await?
-            .run()
-            .await
-        }));
-    }
-
-    // Actors are running now, send them commands
-    for _ in 0..10 {
-        let query = [1u8; VECTOR_SIZE];
-        let mut rng = rand::thread_rng();
-        let shares = SecretSharedVector::create_shares(&query, &mut rng);
-
-        for (index, sender) in senders.iter().enumerate() {
-            sender.send(ActorCommand::Comparison(shares[index].clone()))?;
-        }
-    }
-
-    for handle in handles {
-        handle.await??;
-    }
-
-    Ok(())
-}
-
-async fn run_remote_mode(
+async fn run(
     party_index: usize,
     addresses: Vec<String>,
     max_db: usize,
@@ -569,12 +462,7 @@ async fn run_remote_mode(
     request_parallelism: usize,
     session_per_request: usize,
 ) -> eyre::Result<()> {
-    tracing::info!(
-        "Running in REMOTE mode (party {} of {})",
-        party_index,
-        addresses.len()
-    );
-    tracing::info!("Addresses: {:?}", addresses);
+    tracing::info!("Running party {} of {}", party_index, addresses.len());
     tracing::info!(
         "Config: max_db={}, connection_parallelism={}, request_parallelism={}, session_per_request={}",
         max_db,
@@ -604,7 +492,6 @@ async fn run_remote_mode(
             let mut rng = StdRng::seed_from_u64(42);
             let shares = SecretSharedVector::create_shares(&query, &mut rng);
 
-            // Send the share corresponding to this party's index
             if let Err(e) = sender.send(ActorCommand::Comparison(shares[party_index].clone())) {
                 tracing::error!("Failed to send comparison command {}: {}", i, e);
                 break;
@@ -615,7 +502,6 @@ async fn run_remote_mode(
 
     tracing::info!("Waiting for network connections and processing commands...");
 
-    // Run the actor (it will process commands from the channel)
     actor.run().await
 }
 
