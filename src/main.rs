@@ -306,7 +306,7 @@ impl Actor {
 
         let db = Arc::clone(&self.db);
         let db_len = db.len();
-        let target_chunks = max(1, num_network_workers * 4);
+        let target_chunks = max(1, num_network_workers);
         let chunk_size = max(1, (db_len + target_chunks - 1) / target_chunks);
 
         let mut chunk_bounds = Vec::new();
@@ -344,11 +344,9 @@ impl Actor {
                 while let Some((chunk_id, distances, _cpu_us)) = worker_rx.recv().await {
                     let network_start = Instant::now();
                     let galois_start = Instant::now();
-                    let mut chunk_distances = galois_ring_to_rep3(
-                        &mut session,
-                        RingElement::convert_vec_rev(distances),
-                    )
-                    .await?;
+                    let mut chunk_distances =
+                        galois_ring_to_rep3(&mut session, RingElement::convert_vec_rev(distances))
+                            .await?;
                     let galois_us = galois_start.elapsed().as_micros() as u64;
 
                     chunk_distances.iter_mut().for_each(|share| {
@@ -411,8 +409,7 @@ impl Actor {
         }
         drop(worker_senders);
 
-        while let Some((chunk_id, results, network_us, galois_us, lte_us)) =
-            result_rx.recv().await
+        while let Some((chunk_id, results, network_us, galois_us, lte_us)) = result_rx.recv().await
         {
             chunk_results[chunk_id] = results;
             network_times.push(network_us);
