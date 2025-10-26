@@ -422,8 +422,8 @@ impl Actor {
         Self::print_hist("Total:", &self.total_hist);
         Self::print_hist("CPU:", &self.cpu_hist);
         Self::print_hist("Network:", &self.network_hist);
-        Self::print_hist("  Galois:", &self.galois_ring_hist);
-        Self::print_hist("  LTE:", &self.lte_threshold_hist);
+        Self::print_hist("  galois_ring_to_rep3:", &self.galois_ring_hist);
+        Self::print_hist("  lte_threshold_and_open_u16:", &self.lte_threshold_hist);
         tracing::info!("═══════════════════════════════════════════════════════");
 
         sleep(std::time::Duration::from_secs(5)).await;
