@@ -92,10 +92,6 @@ struct Actor {
     total_comparisons: usize,
     total_requests: usize,
     total_hist: Histogram<u64>,
-    cpu_hist: Histogram<u64>,
-    network_hist: Histogram<u64>,
-    galois_ring_hist: Histogram<u64>,
-    lte_threshold_hist: Histogram<u64>,
 }
 
 fn udot(a: &[u16], b: &[u16]) -> u16 {
@@ -282,10 +278,6 @@ impl Actor {
             total_comparisons: 0,
             total_requests: 0,
             total_hist: Histogram::new(3).unwrap(),
-            cpu_hist: Histogram::new(3).unwrap(),
-            network_hist: Histogram::new(3).unwrap(),
-            galois_ring_hist: Histogram::new(3).unwrap(),
-            lte_threshold_hist: Histogram::new(3).unwrap(),
         })
     }
 
@@ -328,12 +320,11 @@ impl Actor {
         }
 
         let worker_count = min(num_network_workers, chunk_count);
-        let (result_tx, mut result_rx) =
-            mpsc::channel::<(usize, Vec<bool>, u64, u64, u64)>(chunk_count);
+        let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(chunk_count);
         let mut worker_senders = Vec::with_capacity(worker_count);
         let mut network_handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            let (worker_tx, mut worker_rx) = mpsc::channel::<(usize, Vec<u16>, u64)>(max(
+            let (worker_tx, mut worker_rx) = mpsc::channel::<(usize, Vec<u16>)>(max(
                 1,
                 (chunk_count + worker_count - 1) / worker_count,
             ));
@@ -341,26 +332,20 @@ impl Actor {
             let result_tx = result_tx.clone();
             let mut session = self.network.sessions.get().await?;
             network_handles.push(tokio::spawn(async move {
-                while let Some((chunk_id, distances, _cpu_us)) = worker_rx.recv().await {
-                    let network_start = Instant::now();
-                    let galois_start = Instant::now();
+                while let Some((chunk_id, distances)) = worker_rx.recv().await {
                     let mut chunk_distances =
                         galois_ring_to_rep3(&mut session, RingElement::convert_vec_rev(distances))
                             .await?;
-                    let galois_us = galois_start.elapsed().as_micros() as u64;
 
                     chunk_distances.iter_mut().for_each(|share| {
                         sub_pub(&mut session, share, RingElement(THRESHOLD));
                     });
 
-                    let lte_start = Instant::now();
                     let chunk_results =
                         lte_threshold_and_open_u16(&mut session, &chunk_distances).await?;
-                    let lte_us = lte_start.elapsed().as_micros() as u64;
-                    let network_us = network_start.elapsed().as_micros() as u64;
 
                     result_tx
-                        .send((chunk_id, chunk_results, network_us, galois_us, lte_us))
+                        .send((chunk_id, chunk_results))
                         .await
                         .context("Network stage failed to send chunk result")?;
                 }
@@ -369,11 +354,7 @@ impl Actor {
         }
         drop(result_tx);
 
-        let mut cpu_times = vec![0u64; chunk_count];
         let mut chunk_results = vec![Vec::new(); chunk_count];
-        let mut network_times = Vec::new();
-        let mut galois_times = Vec::new();
-        let mut lte_times = Vec::new();
 
         let mut cpu_tasks = JoinSet::new();
         for (chunk_id, (chunk_start, chunk_end)) in chunk_bounds.into_iter().enumerate() {
@@ -381,13 +362,11 @@ impl Actor {
             let db = Arc::clone(&db);
             cpu_tasks.spawn(async move {
                 let handle = task::spawn_blocking(move || {
-                    let cpu_start = Instant::now();
                     let distances = db[chunk_start..chunk_end]
                         .iter()
                         .map(|db_vec| udot(&query.0, db_vec))
                         .collect::<Vec<_>>();
-                    let cpu_us = cpu_start.elapsed().as_micros() as u64;
-                    (chunk_id, distances, cpu_us)
+                    (chunk_id, distances)
                 });
                 let result = handle
                     .await
@@ -398,26 +377,22 @@ impl Actor {
 
         // Track expected next chunk for each worker to ensure ordering
         let mut expected_chunks: Vec<usize> = (0..worker_count).collect();
-        let mut buffered_chunks: std::collections::HashMap<usize, (Vec<u16>, u64)> =
+        let mut buffered_chunks: std::collections::HashMap<usize, Vec<u16>> =
             std::collections::HashMap::new();
 
         while let Some(task_result) = cpu_tasks.join_next().await {
-            let (chunk_id, distances, cpu_us) =
-                task_result.context("CPU producer task join error")??;
-            cpu_times[chunk_id] = cpu_us;
+            let (chunk_id, distances) = task_result.context("CPU producer task join error")??;
 
             // Buffer this chunk
-            buffered_chunks.insert(chunk_id, (distances, cpu_us));
+            buffered_chunks.insert(chunk_id, distances);
 
             // Try to send any buffered chunks that are now in order
             for worker_idx in 0..worker_count {
-                while let Some((distances, cpu_us)) =
-                    buffered_chunks.remove(&expected_chunks[worker_idx])
-                {
+                while let Some(distances) = buffered_chunks.remove(&expected_chunks[worker_idx]) {
                     let chunk_id = expected_chunks[worker_idx];
                     let sender = worker_senders[worker_idx].clone();
                     sender
-                        .send((chunk_id, distances, cpu_us))
+                        .send((chunk_id, distances))
                         .await
                         .context("Failed to dispatch chunk to network worker")?;
                     expected_chunks[worker_idx] += worker_count;
@@ -426,12 +401,8 @@ impl Actor {
         }
         drop(worker_senders);
 
-        while let Some((chunk_id, results, network_us, galois_us, lte_us)) = result_rx.recv().await
-        {
+        while let Some((chunk_id, results)) = result_rx.recv().await {
             chunk_results[chunk_id] = results;
-            network_times.push(network_us);
-            galois_times.push(galois_us);
-            lte_times.push(lte_us);
         }
 
         for handle in network_handles {
@@ -439,32 +410,18 @@ impl Actor {
         }
 
         let results = chunk_results.into_iter().flatten().collect_vec();
-        let cpu_us = cpu_times.iter().max().copied().unwrap_or(0);
-        let network_us = network_times.iter().max().copied().unwrap_or(0);
         let total_us = start_total.elapsed().as_micros() as u64;
-
-        // Record sub-phase timings (use max across workers for consistency)
-        if let Some(&max_galois) = galois_times.iter().max() {
-            self.galois_ring_hist.record(max_galois).ok();
-        }
-        if let Some(&max_lte) = lte_times.iter().max() {
-            self.lte_threshold_hist.record(max_lte).ok();
-        }
 
         // Record timings
         self.total_hist.record(total_us).ok();
-        self.cpu_hist.record(cpu_us).ok();
-        self.network_hist.record(network_us).ok();
         self.total_comparisons += results.len();
         self.total_requests += 1;
 
         // Print per-request summary
         tracing::info!(
-            "Actor {} | Total: {:?} (CPU: {:?}, Net: {:?}) | {:.2}M comp/s",
+            "Actor {} | Total: {:?} | {:.2}M comp/s",
             self.party_index,
             std::time::Duration::from_micros(total_us),
-            std::time::Duration::from_micros(cpu_us),
-            std::time::Duration::from_micros(network_us),
             (results.len() as f64) / (total_us as f64 / 1e6) / 1e6
         );
 
@@ -496,10 +453,6 @@ impl Actor {
             self.total_requests
         );
         Self::print_hist("Total:", &self.total_hist);
-        Self::print_hist("CPU:", &self.cpu_hist);
-        Self::print_hist("Network:", &self.network_hist);
-        Self::print_hist("  to_rep3:", &self.galois_ring_hist);
-        Self::print_hist("  threshold:", &self.lte_threshold_hist);
         tracing::info!("═══════════════════════════════════════════════════════");
 
         sleep(std::time::Duration::from_secs(5)).await;
