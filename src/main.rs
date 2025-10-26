@@ -20,6 +20,7 @@ use itertools::Itertools;
 use rand::{CryptoRng, Rng, SeedableRng, rngs::StdRng};
 use std::{
     cmp::{max, min},
+    collections::BTreeMap,
     sync::Arc,
     time::Instant,
 };
@@ -376,6 +377,9 @@ impl Actor {
         let mut network_times = Vec::new();
         let mut galois_times = Vec::new();
         let mut lte_times = Vec::new();
+        let mut pending_chunks: Vec<BTreeMap<usize, (Vec<u16>, u64)>> =
+            vec![BTreeMap::new(); worker_count];
+        let mut next_expected: Vec<usize> = (0..worker_count).collect();
 
         let mut cpu_tasks = JoinSet::new();
         for (chunk_id, (chunk_start, chunk_end)) in chunk_bounds.into_iter().enumerate() {
@@ -403,11 +407,23 @@ impl Actor {
                 task_result.context("CPU producer task join error")??;
             cpu_times[chunk_id] = cpu_us;
             let worker_idx = chunk_id % worker_count;
-            let sender = worker_senders[worker_idx].clone();
-            sender
-                .send((chunk_id, distances, cpu_us))
-                .await
-                .context("Failed to dispatch chunk to network worker")?;
+            pending_chunks[worker_idx].insert(chunk_id, (distances, cpu_us));
+
+            loop {
+                let expected = next_expected[worker_idx];
+                let Some((distances, cpu_us)) =
+                    pending_chunks[worker_idx].remove(&expected)
+                else {
+                    break;
+                };
+
+                let sender = worker_senders[worker_idx].clone();
+                sender
+                    .send((expected, distances, cpu_us))
+                    .await
+                    .context("Failed to dispatch chunk to network worker")?;
+                next_expected[worker_idx] += worker_count;
+            }
         }
         drop(worker_senders);
 
