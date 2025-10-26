@@ -1,6 +1,6 @@
 use clap::Parser;
 use deadpool::unmanaged::Pool;
-use eyre::{Context, bail};
+use eyre::Context;
 use hdrhistogram::Histogram;
 use iris_mpc_common::galois::degree4::{GaloisRingElement, ShamirGaloisRingShare, basis};
 use iris_mpc_cpu::{
@@ -279,13 +279,7 @@ impl Actor {
         preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
         let shared_vector = Arc::new(preprocessed_vector);
 
-        let num_network_workers = min(
-            self.network.sessions.status().size,
-            num_cpus::get_physical(),
-        );
-        if num_network_workers == 0 {
-            bail!("No sessions available for comparison");
-        }
+        let num_network_workers = self.network.sessions.status().size;
 
         let db = Arc::clone(&self.db);
         let db_len = db.len();
@@ -303,13 +297,14 @@ impl Actor {
         let worker_count = min(num_network_workers, chunk_count);
         let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(chunk_count);
 
-        // Fetch all sessions and sort by ID for deterministic assignment across nodes
+        // Fetch all sessions and sort to guarantee consistent assignment
         let mut sessions = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             sessions.push(self.network.sessions.get().await?);
         }
         sessions.sort_by_key(|s| s.network_session.session_id);
 
+        // Start network workers
         let mut worker_senders = Vec::with_capacity(worker_count);
         let mut network_handles = Vec::with_capacity(worker_count);
         for mut session in sessions {
@@ -336,8 +331,8 @@ impl Actor {
         }
         drop(result_tx);
 
+        // Start CPU workers
         let mut chunk_results = vec![Vec::new(); chunk_count];
-
         let mut cpu_tasks = JoinSet::new();
         for (chunk_id, (chunk_start, chunk_end)) in chunk_bounds.into_iter().enumerate() {
             let query = Arc::clone(&shared_vector);
@@ -355,13 +350,15 @@ impl Actor {
             });
         }
 
-        // Track expected next chunk for each worker to ensure ordering
+        // Coordinate CPU and network workers
+        // We need to ensure that chunks are sent to network workers in the same order on all parties
+        // Some CPU workers might finish out-of-order, so we buffer them here
         let mut expected_chunks: Vec<usize> = (0..worker_count).collect();
         let mut buffered_chunks: std::collections::HashMap<usize, Vec<u16>> =
             std::collections::HashMap::new();
 
         while let Some(task_result) = cpu_tasks.join_next().await {
-            let (chunk_id, distances) = task_result.context("CPU producer task join error")??;
+            let (chunk_id, distances) = task_result??;
 
             // Buffer this chunk
             buffered_chunks.insert(chunk_id, distances);
@@ -371,9 +368,7 @@ impl Actor {
                 while let Some(distances) = buffered_chunks.remove(&expected_chunks[worker_idx]) {
                     let chunk_id = expected_chunks[worker_idx];
                     let sender = worker_senders[worker_idx].clone();
-                    sender
-                        .send((chunk_id, distances))
-                        .context("Failed to dispatch chunk to network worker")?;
+                    sender.send((chunk_id, distances))?;
                     expected_chunks[worker_idx] += worker_count;
                 }
             }
@@ -385,7 +380,7 @@ impl Actor {
         }
 
         for handle in network_handles {
-            handle.await.context("Network worker join error")??;
+            handle.await??;
         }
 
         let results = chunk_results.into_iter().flatten().collect_vec();
