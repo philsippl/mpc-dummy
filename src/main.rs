@@ -20,7 +20,6 @@ use itertools::Itertools;
 use rand::{CryptoRng, Rng, SeedableRng, rngs::StdRng};
 use std::{
     cmp::{max, min},
-    collections::BTreeMap,
     sync::Arc,
     time::Instant,
 };
@@ -307,8 +306,8 @@ impl Actor {
 
         let db = Arc::clone(&self.db);
         let db_len = db.len();
-        let target_chunks = max(1, num_network_workers * 4);
-        let chunk_size = max(1, (db_len + target_chunks - 1) / target_chunks);
+        let initial_workers = num_network_workers;
+        let chunk_size = max(1, (db_len + initial_workers - 1) / initial_workers);
 
         let mut chunk_bounds = Vec::new();
         let mut offset = 0usize;
@@ -323,12 +322,7 @@ impl Actor {
             return Ok(());
         }
 
-        let chunk_count = chunk_bounds.len();
-        if chunk_count == 0 {
-            return Ok(());
-        }
-
-        let worker_count = min(num_network_workers, chunk_count);
+        let worker_count = min(initial_workers, chunk_count);
         let (result_tx, mut result_rx) =
             mpsc::channel::<(usize, Vec<bool>, u64, u64, u64)>(chunk_count);
         let mut worker_senders = Vec::with_capacity(worker_count);
@@ -377,10 +371,6 @@ impl Actor {
         let mut network_times = Vec::new();
         let mut galois_times = Vec::new();
         let mut lte_times = Vec::new();
-        let mut pending_chunks: Vec<BTreeMap<usize, (Vec<u16>, u64)>> =
-            vec![BTreeMap::new(); worker_count];
-        let mut next_expected: Vec<usize> = (0..worker_count).collect();
-
         let mut cpu_tasks = JoinSet::new();
         for (chunk_id, (chunk_start, chunk_end)) in chunk_bounds.into_iter().enumerate() {
             let query = Arc::clone(&shared_vector);
@@ -407,23 +397,11 @@ impl Actor {
                 task_result.context("CPU producer task join error")??;
             cpu_times[chunk_id] = cpu_us;
             let worker_idx = chunk_id % worker_count;
-            pending_chunks[worker_idx].insert(chunk_id, (distances, cpu_us));
-
-            loop {
-                let expected = next_expected[worker_idx];
-                let Some((distances, cpu_us)) =
-                    pending_chunks[worker_idx].remove(&expected)
-                else {
-                    break;
-                };
-
-                let sender = worker_senders[worker_idx].clone();
-                sender
-                    .send((expected, distances, cpu_us))
-                    .await
-                    .context("Failed to dispatch chunk to network worker")?;
-                next_expected[worker_idx] += worker_count;
-            }
+            let sender = worker_senders[worker_idx].clone();
+            sender
+                .send((chunk_id, distances, cpu_us))
+                .await
+                .context("Failed to dispatch chunk to network worker")?;
         }
         drop(worker_senders);
 
