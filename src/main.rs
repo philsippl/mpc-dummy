@@ -24,7 +24,10 @@ use std::{
     time::Instant,
 };
 use tokio::time::sleep;
-use tokio::{sync::mpsc, task};
+use tokio::{
+    sync::mpsc,
+    task::{self, JoinSet},
+};
 use tokio_util::sync::CancellationToken;
 
 const VECTOR_SIZE: usize = 512;
@@ -324,14 +327,16 @@ impl Actor {
             return Ok(());
         }
 
+        let worker_count = min(num_network_workers, chunk_count);
         let (result_tx, mut result_rx) =
             mpsc::channel::<(usize, Vec<bool>, u64, u64, u64)>(chunk_count);
-        let mut worker_senders = Vec::new();
-        let mut network_handles = Vec::new();
-
-        for _ in 0..num_network_workers {
-            let (worker_tx, mut worker_rx) =
-                mpsc::channel::<(usize, Vec<u16>, u64)>(max(1, chunk_count / num_network_workers + 1));
+        let mut worker_senders = Vec::with_capacity(worker_count);
+        let mut network_handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let (worker_tx, mut worker_rx) = mpsc::channel::<(usize, Vec<u16>, u64)>(max(
+                1,
+                (chunk_count + worker_count - 1) / worker_count,
+            ));
             worker_senders.push(worker_tx);
             let result_tx = result_tx.clone();
             let mut session = self.network.sessions.get().await?;
@@ -372,24 +377,34 @@ impl Actor {
         let mut galois_times = Vec::new();
         let mut lte_times = Vec::new();
 
+        let mut cpu_tasks = JoinSet::new();
         for (chunk_id, (chunk_start, chunk_end)) in chunk_bounds.into_iter().enumerate() {
             let query = Arc::clone(&shared_vector);
             let db = Arc::clone(&db);
-            let (distances, cpu_us) = task::spawn_blocking(move || {
-                let cpu_start = Instant::now();
-                let distances = db[chunk_start..chunk_end]
-                    .iter()
-                    .map(|db_vec| udot(&query.0, db_vec))
-                    .collect::<Vec<_>>();
-                let cpu_us = cpu_start.elapsed().as_micros() as u64;
-                (distances, cpu_us)
-            })
-            .await
-            .context("CPU worker join error")?;
+            cpu_tasks.spawn(async move {
+                let handle = task::spawn_blocking(move || {
+                    let cpu_start = Instant::now();
+                    let distances = db[chunk_start..chunk_end]
+                        .iter()
+                        .map(|db_vec| udot(&query.0, db_vec))
+                        .collect::<Vec<_>>();
+                    let cpu_us = cpu_start.elapsed().as_micros() as u64;
+                    (chunk_id, distances, cpu_us)
+                });
+                let result = handle
+                    .await
+                    .context("CPU worker join error within blocking task")?;
+                eyre::Result::<_>::Ok(result)
+            });
+        }
 
+        while let Some(task_result) = cpu_tasks.join_next().await {
+            let (chunk_id, distances, cpu_us) =
+                task_result.context("CPU producer task join error")??;
             cpu_times[chunk_id] = cpu_us;
-            let worker_idx = chunk_id % num_network_workers;
-            worker_senders[worker_idx]
+            let worker_idx = chunk_id % worker_count;
+            let sender = worker_senders[worker_idx].clone();
+            sender
                 .send((chunk_id, distances, cpu_us))
                 .await
                 .context("Failed to dispatch chunk to network worker")?;
