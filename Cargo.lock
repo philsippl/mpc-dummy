@@ -3035,6 +3035,7 @@ dependencies = [
  "deadpool",
  "dotenvy",
  "eyre",
+ "futures",
  "hdrhistogram",
  "iris-mpc-common",
  "iris-mpc-cpu",
