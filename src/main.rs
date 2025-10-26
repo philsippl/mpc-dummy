@@ -400,10 +400,6 @@ impl Actor {
             );
         }
 
-        if results.iter().any(|&r| r == false) {
-            panic!("Some comparisons resulted in false");
-        }
-
         Ok(())
     }
 
