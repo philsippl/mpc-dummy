@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use deadpool::unmanaged::Pool;
 use eyre::{Context, bail};
+use hdrhistogram::Histogram;
 use iris_mpc_common::galois::degree4::{GaloisRingElement, ShamirGaloisRingShare, basis};
 use iris_mpc_cpu::{
     execution::{
@@ -19,11 +20,7 @@ use itertools::Itertools;
 use rand::{CryptoRng, Rng, SeedableRng, rngs::StdRng};
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
-use std::{
-    cmp::min,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{cmp::min, sync::Arc, time::Instant};
 use tokio::time::sleep;
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
@@ -87,10 +84,13 @@ struct Actor {
     party_index: usize,
     network: Network,
     command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
-    // Running statistics
     total_comparisons: usize,
     total_requests: usize,
-    first_request_time: Option<Instant>,
+    total_hist: Histogram<u64>,
+    cpu_hist: Histogram<u64>,
+    network_hist: Histogram<u64>,
+    galois_ring_hist: Histogram<u64>,
+    lte_threshold_hist: Histogram<u64>,
 }
 
 fn udot(a: &[u16], b: &[u16]) -> u16 {
@@ -241,6 +241,16 @@ impl Network {
 }
 
 impl Actor {
+    fn print_hist(name: &str, hist: &Histogram<u64>) {
+        tracing::info!(
+            "{:12} min={:?} max={:?} mean={:?}",
+            name,
+            std::time::Duration::from_micros(hist.min()),
+            std::time::Duration::from_micros(hist.max()),
+            std::time::Duration::from_micros(hist.mean() as u64)
+        );
+    }
+
     async fn new(
         party_index: usize,
         addresses: Vec<String>,
@@ -266,24 +276,30 @@ impl Actor {
             command_receiver,
             total_comparisons: 0,
             total_requests: 0,
-            first_request_time: None,
+            total_hist: Histogram::new(3).unwrap(),
+            cpu_hist: Histogram::new(3).unwrap(),
+            network_hist: Histogram::new(3).unwrap(),
+            galois_ring_hist: Histogram::new(3).unwrap(),
+            lte_threshold_hist: Histogram::new(3).unwrap(),
         })
     }
 
     async fn run_comparison(&mut self, vector: SecretSharedVector) -> eyre::Result<()> {
-        tracing::info!("Running comparison for actor {}", self.party_index);
-
-        let now = Instant::now();
+        let start_total = Instant::now();
 
         let mut preprocessed_vector = vector.clone();
         preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
 
-        let num_network_workers = min(self.network.sessions.status().size, num_cpus::get_physical());
+        let num_network_workers = min(
+            self.network.sessions.status().size,
+            num_cpus::get_physical(),
+        );
         if num_network_workers == 0 {
             bail!("No sessions available for comparison");
         }
 
-        // Phase 1
+        // Phase 1: CPU
+        let start_cpu = Instant::now();
         let db = Arc::clone(&self.db);
         let all_distances = task::spawn_blocking(move || {
             db.par_iter()
@@ -291,19 +307,12 @@ impl Actor {
                 .collect::<Vec<_>>()
         })
         .await?;
+        let cpu_ms = start_cpu.elapsed().as_micros() as u64;
 
-        tracing::info!(
-            "Actor {} completed CPU phase: {} distances computed in {:?}",
-            self.party_index,
-            all_distances.len(),
-            now.elapsed()
-        );
-
-        let now2 = Instant::now();
-
-        // Phase 2
-        let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(num_network_workers);
-
+        // Phase 2: Network
+        let start_network = Instant::now();
+        let (result_tx, mut result_rx) =
+            mpsc::channel::<(usize, Vec<bool>, u64, u64)>(num_network_workers);
         let mut worker_handles = Vec::new();
 
         for worker_id in 0..num_network_workers {
@@ -315,83 +324,72 @@ impl Actor {
             let result_tx = result_tx.clone();
 
             let handle = task::spawn(async move {
-                // Convert to replicated shares
+                let t0 = Instant::now();
                 let mut chunk_distances = galois_ring_to_rep3(
                     &mut *session,
                     RingElement::convert_vec_rev(chunk_distances),
                 )
                 .await?;
+                let galois_us = t0.elapsed().as_micros() as u64;
 
-                // Subtract threshold
                 chunk_distances
                     .iter_mut()
                     .for_each(|share| sub_pub(&mut *session, share, RingElement(THRESHOLD)));
 
-                // Network: Compare to zero and open results
+                let t1 = Instant::now();
                 let chunk_results =
                     lte_threshold_and_open_u16(&mut *session, &chunk_distances).await?;
+                let lte_us = t1.elapsed().as_micros() as u64;
 
-                // Send results back
-                let _ = result_tx.send((worker_id, chunk_results)).await;
-
+                let _ = result_tx
+                    .send((worker_id, chunk_results, galois_us, lte_us))
+                    .await;
                 eyre::Ok(())
             });
             worker_handles.push(handle);
         }
         drop(result_tx);
 
-        // Collect results from workers
         let mut chunk_results = vec![Vec::new(); num_network_workers];
-        while let Some((worker_id, results)) = result_rx.recv().await {
+        let mut galois_times = Vec::new();
+        let mut lte_times = Vec::new();
+        while let Some((worker_id, results, galois_us, lte_us)) = result_rx.recv().await {
             chunk_results[worker_id] = results;
+            galois_times.push(galois_us);
+            lte_times.push(lte_us);
         }
 
-        // Wait for all workers to finish
         for handle in worker_handles {
             handle.await??;
         }
 
         let results = chunk_results.into_iter().flatten().collect_vec();
+        let network_ms = start_network.elapsed().as_micros() as u64;
+        let total_ms = start_total.elapsed().as_micros() as u64;
 
-        // Update running statistics
-        if self.first_request_time.is_none() {
-            self.first_request_time = Some(now);
+        // Record sub-phase timings (use max across workers for consistency)
+        if let Some(&max_galois) = galois_times.iter().max() {
+            self.galois_ring_hist.record(max_galois).ok();
         }
+        if let Some(&max_lte) = lte_times.iter().max() {
+            self.lte_threshold_hist.record(max_lte).ok();
+        }
+
+        // Record timings
+        self.total_hist.record(total_ms).ok();
+        self.cpu_hist.record(cpu_ms).ok();
+        self.network_hist.record(network_ms).ok();
         self.total_comparisons += results.len();
         self.total_requests += 1;
 
-        // Calculate running average
-        let total_elapsed = self.first_request_time.unwrap().elapsed();
-        let running_avg_comp_per_sec = self.total_comparisons as f64 / total_elapsed.as_secs_f64();
-
+        // Print per-request summary
         tracing::info!(
-            "Actor {} network phase completed in {:?}",
+            "Actor {} | Total: {:?} (CPU: {:?}, Net: {:?}) | {:.2}M comp/s",
             self.party_index,
-            now2.elapsed()
-        );
-
-        // Log results
-        tracing::info!(
-            "Actor {} comparison results[0]: {:?} (len: {})",
-            self.party_index,
-            results[0],
-            results.len()
-        );
-
-        tracing::info!(
-            "Actor {} comparison completed in {:?} ({:.2}M comp/s)",
-            self.party_index,
-            now.elapsed(),
-            (results.len() as f64) / now.elapsed().as_secs_f64() / 1e6
-        );
-
-        tracing::info!(
-            "Actor {} running average: {:.2}M comp/s (total: {} comparisons, {} requests, {:?} elapsed)",
-            self.party_index,
-            running_avg_comp_per_sec / 1e6,
-            self.total_comparisons,
-            self.total_requests,
-            total_elapsed
+            std::time::Duration::from_micros(total_ms),
+            std::time::Duration::from_micros(cpu_ms),
+            std::time::Duration::from_micros(network_ms),
+            (results.len() as f64) / (total_ms as f64 / 1e6) / 1e6
         );
 
         if results.len() != self.db.len() {
@@ -403,9 +401,7 @@ impl Actor {
         }
 
         if results.iter().any(|&r| r == false) {
-            panic!(
-                "Some comparisons resulted in false, which is unexpected given the database and query values."
-            );
+            panic!("Some comparisons resulted in false");
         }
 
         Ok(())
@@ -415,13 +411,26 @@ impl Actor {
         while let Some(command) = self.command_receiver.recv().await {
             match command {
                 ActorCommand::Comparison(vector) => {
-                    tracing::info!("Actor {} received command", self.party_index);
                     self.run_comparison(vector).await?;
                 }
             }
         }
 
-        sleep(Duration::from_secs(5)).await;
+        // Print final summary
+        tracing::info!("═══════════════════════════════════════════════════════");
+        tracing::info!(
+            "Actor {} FINAL SUMMARY ({} requests)",
+            self.party_index,
+            self.total_requests
+        );
+        Self::print_hist("Total:", &self.total_hist);
+        Self::print_hist("CPU:", &self.cpu_hist);
+        Self::print_hist("Network:", &self.network_hist);
+        Self::print_hist("  Galois:", &self.galois_ring_hist);
+        Self::print_hist("  LTE:", &self.lte_threshold_hist);
+        tracing::info!("═══════════════════════════════════════════════════════");
+
+        sleep(std::time::Duration::from_secs(5)).await;
         self.network.cancellation_token.cancel();
 
         Ok(())
