@@ -306,7 +306,7 @@ impl Actor {
 
         let db = Arc::clone(&self.db);
         let db_len = db.len();
-        let target_chunks = max(1, num_network_workers * 8);
+        let target_chunks = max(1, num_network_workers * 2);
         let chunk_size = max(1, (db_len + target_chunks - 1) / target_chunks);
 
         let mut chunk_bounds = Vec::new();
