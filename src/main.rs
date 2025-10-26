@@ -302,13 +302,20 @@ impl Actor {
 
         let worker_count = min(num_network_workers, chunk_count);
         let (result_tx, mut result_rx) = mpsc::channel::<(usize, Vec<bool>)>(chunk_count);
+
+        // Fetch all sessions and sort by ID for deterministic assignment across nodes
+        let mut sessions = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            sessions.push(self.network.sessions.get().await?);
+        }
+        sessions.sort_by_key(|s| s.network_session.session_id);
+
         let mut worker_senders = Vec::with_capacity(worker_count);
         let mut network_handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
+        for mut session in sessions {
             let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<(usize, Vec<u16>)>();
             worker_senders.push(worker_tx);
             let result_tx = result_tx.clone();
-            let mut session = self.network.sessions.get().await?;
             network_handles.push(tokio::spawn(async move {
                 while let Some((chunk_id, distances)) = worker_rx.recv().await {
                     let mut chunk_distances =
