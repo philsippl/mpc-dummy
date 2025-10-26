@@ -20,7 +20,7 @@ use itertools::Itertools;
 use rand::{CryptoRng, Rng, SeedableRng, rngs::StdRng};
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
-use std::{cmp::min, sync::Arc, time::Instant};
+use std::{cmp::min, fs::File, sync::Arc, time::Instant};
 use tokio::time::sleep;
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
@@ -77,6 +77,7 @@ struct Network {
 
 enum ActorCommand {
     Comparison(SecretSharedVector),
+    Terminate,
 }
 
 struct Actor {
@@ -409,6 +410,10 @@ impl Actor {
                 ActorCommand::Comparison(vector) => {
                     self.run_comparison(vector).await?;
                 }
+                ActorCommand::Terminate => {
+                    tracing::info!("Actor {} received termination message", self.party_index);
+                    break;
+                }
             }
         }
 
@@ -441,7 +446,13 @@ async fn main() -> eyre::Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.mode {
+    let guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(1000)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+        .unwrap();
+
+    let party_suffix = match cli.mode {
         Mode::Local => {
             run_local_mode(
                 cli.max_db,
@@ -449,7 +460,8 @@ async fn main() -> eyre::Result<()> {
                 cli.request_parallelism,
                 cli.session_per_request,
             )
-            .await
+            .await?;
+            None
         }
         Mode::Remote {
             party_index,
@@ -463,9 +475,22 @@ async fn main() -> eyre::Result<()> {
                 cli.request_parallelism,
                 cli.session_per_request,
             )
-            .await
+            .await?;
+            Some(party_index)
         }
-    }
+    };
+
+    if let Ok(report) = guard.report().build() {
+        let filename = match party_suffix {
+            Some(index) => format!("flamegraph_{}.svg", index),
+            None => "flamegraph_local.svg".to_string(),
+        };
+        let file = File::create(&filename).unwrap();
+        report.flamegraph(file).unwrap();
+        tracing::info!("Flamegraph saved to {}", filename);
+    };
+
+    Ok(())
 }
 
 async fn run_local_mode(
@@ -525,6 +550,11 @@ async fn run_local_mode(
         }
     }
 
+    // Send termination messages to all actors
+    for sender in senders.iter() {
+        sender.send(ActorCommand::Terminate)?;
+    }
+
     for handle in handles {
         handle.await??;
     }
@@ -570,7 +600,7 @@ async fn run_remote_mode(
     tracing::info!("Actor {} initialized and ready", party_index);
 
     tokio::spawn(async move {
-        for i in 0..100 {
+        for i in 0..5 {
             let query = [1u8; VECTOR_SIZE];
             let mut rng = StdRng::seed_from_u64(42);
             let shares = SecretSharedVector::create_shares(&query, &mut rng);
@@ -581,6 +611,11 @@ async fn run_remote_mode(
                 break;
             }
             tracing::info!("Sent comparison request {} to actor {}", i + 1, party_index);
+        }
+
+        // Send termination message after all test messages
+        if let Err(e) = sender.send(ActorCommand::Terminate) {
+            tracing::error!("Failed to send termination message: {}", e);
         }
     });
 

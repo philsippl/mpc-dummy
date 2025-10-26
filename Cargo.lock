@@ -3014,6 +3014,7 @@ dependencies = [
  "iris-mpc-cpu",
  "itertools 0.14.0",
  "num_cpus",
+ "pprof",
  "rand 0.8.5",
  "rayon",
  "tokio",
