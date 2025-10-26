@@ -396,16 +396,33 @@ impl Actor {
             });
         }
 
+        // Track expected next chunk for each worker to ensure ordering
+        let mut expected_chunks: Vec<usize> = (0..worker_count).collect();
+        let mut buffered_chunks: std::collections::HashMap<usize, (Vec<u16>, u64)> =
+            std::collections::HashMap::new();
+
         while let Some(task_result) = cpu_tasks.join_next().await {
             let (chunk_id, distances, cpu_us) =
                 task_result.context("CPU producer task join error")??;
             cpu_times[chunk_id] = cpu_us;
-            let worker_idx = chunk_id % worker_count;
-            let sender = worker_senders[worker_idx].clone();
-            sender
-                .send((chunk_id, distances, cpu_us))
-                .await
-                .context("Failed to dispatch chunk to network worker")?;
+
+            // Buffer this chunk
+            buffered_chunks.insert(chunk_id, (distances, cpu_us));
+
+            // Try to send any buffered chunks that are now in order
+            for worker_idx in 0..worker_count {
+                while let Some((distances, cpu_us)) =
+                    buffered_chunks.remove(&expected_chunks[worker_idx])
+                {
+                    let chunk_id = expected_chunks[worker_idx];
+                    let sender = worker_senders[worker_idx].clone();
+                    sender
+                        .send((chunk_id, distances, cpu_us))
+                        .await
+                        .context("Failed to dispatch chunk to network worker")?;
+                    expected_chunks[worker_idx] += worker_count;
+                }
+            }
         }
         drop(worker_senders);
 
