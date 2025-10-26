@@ -18,9 +18,7 @@ use iris_mpc_cpu::{
 };
 use itertools::Itertools;
 use rand::{CryptoRng, Rng, SeedableRng, rngs::StdRng};
-use rayon::iter::IntoParallelRefIterator;
-use rayon::iter::ParallelIterator;
-use std::{cmp::min, sync::Arc, time::Instant};
+use std::{cmp::{max, min}, sync::Arc, time::Instant};
 use tokio::time::sleep;
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
@@ -289,6 +287,7 @@ impl Actor {
 
         let mut preprocessed_vector = vector.clone();
         preprocessed_vector.multiply_lagrange_coeffs(self.party_index + 1);
+        let shared_vector = Arc::new(preprocessed_vector);
 
         let num_network_workers = min(
             self.network.sessions.status().size,
@@ -298,51 +297,62 @@ impl Actor {
             bail!("No sessions available for comparison");
         }
 
-        // Phase 1: CPU
-        let start_cpu = Instant::now();
         let db = Arc::clone(&self.db);
-        let all_distances = task::spawn_blocking(move || {
-            db.par_iter()
-                .map(|db_vec| udot(&preprocessed_vector.0, db_vec))
-                .collect::<Vec<_>>()
-        })
-        .await?;
-        let cpu_ms = start_cpu.elapsed().as_micros() as u64;
+        let db_len = db.len();
+        let chunk_size = max(1, (db_len + num_network_workers - 1) / num_network_workers);
 
-        // Phase 2: Network
-        let start_network = Instant::now();
+        let mut chunk_bounds = Vec::new();
+        let mut offset = 0usize;
+        while offset < db_len {
+            let end = min(offset + chunk_size, db_len);
+            chunk_bounds.push((offset, end));
+            offset = end;
+        }
+
+        let chunk_count = chunk_bounds.len();
         let (result_tx, mut result_rx) =
-            mpsc::channel::<(usize, Vec<bool>, u64, u64)>(num_network_workers);
+            mpsc::channel::<(usize, Vec<bool>, u64, u64, u64, u64)>(max(1, chunk_count));
         let mut worker_handles = Vec::new();
 
-        for worker_id in 0..num_network_workers {
+        for (chunk_id, (chunk_start, chunk_end)) in chunk_bounds.into_iter().enumerate() {
             let mut session = self.network.sessions.get().await?;
-            let chunk_start = worker_id * all_distances.len() / num_network_workers;
-            let chunk_end = ((worker_id + 1) * all_distances.len() / num_network_workers)
-                .min(all_distances.len());
-            let chunk_distances = all_distances[chunk_start..chunk_end].to_vec();
             let result_tx = result_tx.clone();
+            let query = Arc::clone(&shared_vector);
+            let db = Arc::clone(&db);
 
             let handle = task::spawn(async move {
-                let t0 = Instant::now();
+                let cpu_start = Instant::now();
+                let distances = task::spawn_blocking(move || {
+                    db[chunk_start..chunk_end]
+                        .iter()
+                        .map(|db_vec| udot(&query.0, db_vec))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .context("CPU worker task panicked")?;
+                let cpu_us = cpu_start.elapsed().as_micros() as u64;
+
+                let network_start = Instant::now();
+                let galois_start = Instant::now();
                 let mut chunk_distances = galois_ring_to_rep3(
                     &mut *session,
-                    RingElement::convert_vec_rev(chunk_distances),
+                    RingElement::convert_vec_rev(distances),
                 )
                 .await?;
-                let galois_us = t0.elapsed().as_micros() as u64;
+                let galois_us = galois_start.elapsed().as_micros() as u64;
 
                 chunk_distances
                     .iter_mut()
                     .for_each(|share| sub_pub(&mut *session, share, RingElement(THRESHOLD)));
 
-                let t1 = Instant::now();
+                let lte_start = Instant::now();
                 let chunk_results =
                     lte_threshold_and_open_u16(&mut *session, &chunk_distances).await?;
-                let lte_us = t1.elapsed().as_micros() as u64;
+                let lte_us = lte_start.elapsed().as_micros() as u64;
+                let network_us = network_start.elapsed().as_micros() as u64;
 
                 let _ = result_tx
-                    .send((worker_id, chunk_results, galois_us, lte_us))
+                    .send((chunk_id, chunk_results, cpu_us, network_us, galois_us, lte_us))
                     .await;
                 eyre::Ok(())
             });
@@ -350,11 +360,17 @@ impl Actor {
         }
         drop(result_tx);
 
-        let mut chunk_results = vec![Vec::new(); num_network_workers];
+        let mut chunk_results = vec![Vec::new(); chunk_count];
+        let mut cpu_times = Vec::new();
+        let mut network_times = Vec::new();
         let mut galois_times = Vec::new();
         let mut lte_times = Vec::new();
-        while let Some((worker_id, results, galois_us, lte_us)) = result_rx.recv().await {
-            chunk_results[worker_id] = results;
+        while let Some((chunk_id, results, cpu_us, network_us, galois_us, lte_us)) =
+            result_rx.recv().await
+        {
+            chunk_results[chunk_id] = results;
+            cpu_times.push(cpu_us);
+            network_times.push(network_us);
             galois_times.push(galois_us);
             lte_times.push(lte_us);
         }
@@ -364,8 +380,9 @@ impl Actor {
         }
 
         let results = chunk_results.into_iter().flatten().collect_vec();
-        let network_ms = start_network.elapsed().as_micros() as u64;
-        let total_ms = start_total.elapsed().as_micros() as u64;
+        let cpu_us = cpu_times.iter().max().copied().unwrap_or(0);
+        let network_us = network_times.iter().max().copied().unwrap_or(0);
+        let total_us = start_total.elapsed().as_micros() as u64;
 
         // Record sub-phase timings (use max across workers for consistency)
         if let Some(&max_galois) = galois_times.iter().max() {
@@ -376,9 +393,9 @@ impl Actor {
         }
 
         // Record timings
-        self.total_hist.record(total_ms).ok();
-        self.cpu_hist.record(cpu_ms).ok();
-        self.network_hist.record(network_ms).ok();
+        self.total_hist.record(total_us).ok();
+        self.cpu_hist.record(cpu_us).ok();
+        self.network_hist.record(network_us).ok();
         self.total_comparisons += results.len();
         self.total_requests += 1;
 
@@ -386,10 +403,10 @@ impl Actor {
         tracing::info!(
             "Actor {} | Total: {:?} (CPU: {:?}, Net: {:?}) | {:.2}M comp/s",
             self.party_index,
-            std::time::Duration::from_micros(total_ms),
-            std::time::Duration::from_micros(cpu_ms),
-            std::time::Duration::from_micros(network_ms),
-            (results.len() as f64) / (total_ms as f64 / 1e6) / 1e6
+            std::time::Duration::from_micros(total_us),
+            std::time::Duration::from_micros(cpu_us),
+            std::time::Duration::from_micros(network_us),
+            (results.len() as f64) / (total_us as f64 / 1e6) / 1e6
         );
 
         if results.len() != self.db.len() {
