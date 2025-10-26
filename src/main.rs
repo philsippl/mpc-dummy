@@ -306,8 +306,8 @@ impl Actor {
 
         let db = Arc::clone(&self.db);
         let db_len = db.len();
-        let initial_workers = num_network_workers;
-        let chunk_size = max(1, (db_len + initial_workers - 1) / initial_workers);
+        let target_chunks = max(1, num_network_workers * 4);
+        let chunk_size = max(1, (db_len + target_chunks - 1) / target_chunks);
 
         let mut chunk_bounds = Vec::new();
         let mut offset = 0usize;
@@ -322,7 +322,12 @@ impl Actor {
             return Ok(());
         }
 
-        let worker_count = min(initial_workers, chunk_count);
+        let chunk_count = chunk_bounds.len();
+        if chunk_count == 0 {
+            return Ok(());
+        }
+
+        let worker_count = min(num_network_workers, chunk_count);
         let (result_tx, mut result_rx) =
             mpsc::channel::<(usize, Vec<bool>, u64, u64, u64)>(chunk_count);
         let mut worker_senders = Vec::with_capacity(worker_count);
@@ -371,6 +376,7 @@ impl Actor {
         let mut network_times = Vec::new();
         let mut galois_times = Vec::new();
         let mut lte_times = Vec::new();
+
         let mut cpu_tasks = JoinSet::new();
         for (chunk_id, (chunk_start, chunk_end)) in chunk_bounds.into_iter().enumerate() {
             let query = Arc::clone(&shared_vector);
