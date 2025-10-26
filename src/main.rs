@@ -319,89 +319,85 @@ impl Actor {
             return Ok(());
         }
 
-        let chunk_ranges = chunk_bounds;
-        let chunk_count = chunk_ranges.len();
+        let chunk_count = chunk_bounds.len();
         if chunk_count == 0 {
             return Ok(());
         }
 
-        let (cpu_tx, mut cpu_rx) = mpsc::channel::<(usize, Vec<u16>, u64)>(chunk_count);
-        let cpu_producer = {
-            let cpu_tx = cpu_tx.clone();
-            let query = Arc::clone(&shared_vector);
-            let db = Arc::clone(&db);
-            tokio::spawn(async move {
-                for (chunk_id, (chunk_start, chunk_end)) in chunk_ranges.iter().copied().enumerate()
-                {
-                    let query = Arc::clone(&query);
-                    let db = Arc::clone(&db);
-                    let (distances, cpu_us) = task::spawn_blocking(move || {
-                        let cpu_start = Instant::now();
-                        let distances = db[chunk_start..chunk_end]
-                            .iter()
-                            .map(|db_vec| udot(&query.0, db_vec))
-                            .collect::<Vec<_>>();
-                        let cpu_us = cpu_start.elapsed().as_micros() as u64;
-                        (distances, cpu_us)
-                    })
-                    .await
-                    .context("CPU worker join error")?;
-
-                    cpu_tx
-                        .send((chunk_id, distances, cpu_us))
-                        .await
-                        .context("CPU stage failed to send chunk")?;
-                }
-                eyre::Result::<()>::Ok(())
-            })
-        };
-        drop(cpu_tx);
-
         let (result_tx, mut result_rx) =
             mpsc::channel::<(usize, Vec<bool>, u64, u64, u64)>(chunk_count);
+        let mut worker_senders = Vec::new();
         let mut network_handles = Vec::new();
+
+        for _ in 0..num_network_workers {
+            let (worker_tx, mut worker_rx) =
+                mpsc::channel::<(usize, Vec<u16>, u64)>(max(1, chunk_count / num_network_workers + 1));
+            worker_senders.push(worker_tx);
+            let result_tx = result_tx.clone();
+            let mut session = self.network.sessions.get().await?;
+            network_handles.push(tokio::spawn(async move {
+                while let Some((chunk_id, distances, _cpu_us)) = worker_rx.recv().await {
+                    let network_start = Instant::now();
+                    let galois_start = Instant::now();
+                    let mut chunk_distances = galois_ring_to_rep3(
+                        &mut session,
+                        RingElement::convert_vec_rev(distances),
+                    )
+                    .await?;
+                    let galois_us = galois_start.elapsed().as_micros() as u64;
+
+                    chunk_distances.iter_mut().for_each(|share| {
+                        sub_pub(&mut session, share, RingElement(THRESHOLD));
+                    });
+
+                    let lte_start = Instant::now();
+                    let chunk_results =
+                        lte_threshold_and_open_u16(&mut session, &chunk_distances).await?;
+                    let lte_us = lte_start.elapsed().as_micros() as u64;
+                    let network_us = network_start.elapsed().as_micros() as u64;
+
+                    result_tx
+                        .send((chunk_id, chunk_results, network_us, galois_us, lte_us))
+                        .await
+                        .context("Network stage failed to send chunk result")?;
+                }
+                eyre::Result::<()>::Ok(())
+            }));
+        }
+        drop(result_tx);
+
         let mut cpu_times = vec![0u64; chunk_count];
         let mut chunk_results = vec![Vec::new(); chunk_count];
         let mut network_times = Vec::new();
         let mut galois_times = Vec::new();
         let mut lte_times = Vec::new();
 
-        while let Some((chunk_id, distances, cpu_us)) = cpu_rx.recv().await {
-            cpu_times[chunk_id] = cpu_us;
-            let mut session = self.network.sessions.get().await?;
-            let result_tx = result_tx.clone();
-            network_handles.push(tokio::spawn(async move {
-                let network_start = Instant::now();
-                let galois_start = Instant::now();
-                let mut chunk_distances =
-                    galois_ring_to_rep3(&mut session, RingElement::convert_vec_rev(distances))
-                        .await?;
-                let galois_us = galois_start.elapsed().as_micros() as u64;
-
-                chunk_distances.iter_mut().for_each(|share| {
-                    sub_pub(&mut session, share, RingElement(THRESHOLD));
-                });
-
-                let lte_start = Instant::now();
-                let chunk_results =
-                    lte_threshold_and_open_u16(&mut session, &chunk_distances).await?;
-                let lte_us = lte_start.elapsed().as_micros() as u64;
-                let network_us = network_start.elapsed().as_micros() as u64;
-
-                result_tx
-                    .send((chunk_id, chunk_results, network_us, galois_us, lte_us))
-                    .await
-                    .context("Network stage failed to send chunk result")?;
-                eyre::Result::<()>::Ok(())
-            }));
-        }
-        drop(result_tx);
-
-        cpu_producer
+        for (chunk_id, (chunk_start, chunk_end)) in chunk_bounds.into_iter().enumerate() {
+            let query = Arc::clone(&shared_vector);
+            let db = Arc::clone(&db);
+            let (distances, cpu_us) = task::spawn_blocking(move || {
+                let cpu_start = Instant::now();
+                let distances = db[chunk_start..chunk_end]
+                    .iter()
+                    .map(|db_vec| udot(&query.0, db_vec))
+                    .collect::<Vec<_>>();
+                let cpu_us = cpu_start.elapsed().as_micros() as u64;
+                (distances, cpu_us)
+            })
             .await
-            .context("CPU producer task join error")??;
+            .context("CPU worker join error")?;
 
-        while let Some((chunk_id, results, network_us, galois_us, lte_us)) = result_rx.recv().await
+            cpu_times[chunk_id] = cpu_us;
+            let worker_idx = chunk_id % num_network_workers;
+            worker_senders[worker_idx]
+                .send((chunk_id, distances, cpu_us))
+                .await
+                .context("Failed to dispatch chunk to network worker")?;
+        }
+        drop(worker_senders);
+
+        while let Some((chunk_id, results, network_us, galois_us, lte_us)) =
+            result_rx.recv().await
         {
             chunk_results[chunk_id] = results;
             network_times.push(network_us);
