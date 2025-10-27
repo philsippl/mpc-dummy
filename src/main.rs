@@ -75,7 +75,10 @@ struct Network {
 }
 
 enum ActorCommand {
-    Comparison(SecretSharedVector),
+    Comparison {
+        index: usize,
+        vector: SecretSharedVector,
+    },
 }
 
 struct Actor {
@@ -83,6 +86,7 @@ struct Actor {
     party_index: usize,
     network: Network,
     command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
+    results_sender: mpsc::UnboundedSender<(usize, Vec<bool>)>,
     total_comparisons: usize,
     total_requests: usize,
     total_hist: Histogram<u64>,
@@ -131,6 +135,14 @@ impl Vector {
             *element = rng.gen_range(-8..7) // int4 range
         }
         Vector(vec)
+    }
+
+    fn dot(&self, other: &Vector) -> i16 {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .map(|(&a, &b)| (a as i16) * (b as i16))
+            .sum()
     }
 
     pub fn secret_share<R: CryptoRng + Rng>(&self, rng: &mut R) -> [SecretSharedVector; 3] {
@@ -264,6 +276,7 @@ impl Actor {
         party_index: usize,
         addresses: Vec<String>,
         command_receiver: mpsc::UnboundedReceiver<ActorCommand>,
+        results_sender: mpsc::UnboundedSender<(usize, Vec<bool>)>,
         connection_parallelism: usize,
         request_parallelism: usize,
         sessions_per_request: usize,
@@ -283,24 +296,31 @@ impl Actor {
             party_index,
             network,
             command_receiver,
+            results_sender,
             total_comparisons: 0,
             total_requests: 0,
             total_hist: Histogram::new(3).unwrap(),
         })
     }
 
-    fn fill_db_with_random_shares(&mut self) -> eyre::Result<()> {
+    fn fill_db_with_random_shares(&mut self) -> eyre::Result<Vec<Vector>> {
         let db_mut = Arc::get_mut(&mut self.db).context("Failed to get mutable db reference")?;
+        let mut vectors = Vec::with_capacity(db_mut.len());
         for (index, vec) in db_mut.iter_mut().enumerate() {
             let mut rng = StdRng::seed_from_u64(index as u64);
             let vector = Vector::random(&mut rng);
             let shares = vector.secret_share(&mut rng);
             *vec = shares[self.party_index].0;
+            vectors.push(vector);
         }
-        Ok(())
+        Ok(vectors)
     }
 
-    async fn run_comparison(&mut self, vector: SecretSharedVector) -> eyre::Result<()> {
+    async fn run_comparison(
+        &mut self,
+        index: usize,
+        vector: SecretSharedVector,
+    ) -> eyre::Result<()> {
         let start_total = Instant::now();
 
         let mut preprocessed_vector = vector.clone();
@@ -436,14 +456,17 @@ impl Actor {
             );
         }
 
+        // Send results through channel
+        self.results_sender.send((index, results))?;
+
         Ok(())
     }
 
     async fn run(&mut self) -> eyre::Result<()> {
         while let Some(command) = self.command_receiver.recv().await {
             match command {
-                ActorCommand::Comparison(vector) => {
-                    self.run_comparison(vector).await?;
+                ActorCommand::Comparison { index, vector } => {
+                    self.run_comparison(index, vector).await?;
                 }
             }
         }
@@ -501,12 +524,14 @@ async fn run(
         session_per_request
     );
 
-    let (sender, receiver) = mpsc::unbounded_channel();
+    let (command_sender, command_receiver) = mpsc::unbounded_channel();
+    let (results_sender, mut results_receiver) = mpsc::unbounded_channel();
 
     let mut actor = Actor::new(
         party_index,
         addresses,
-        receiver,
+        command_receiver,
+        results_sender,
         connection_parallelism,
         request_parallelism,
         session_per_request,
@@ -516,17 +541,20 @@ async fn run(
 
     tracing::info!("Filling database with random shares...");
 
-    actor.fill_db_with_random_shares()?;
+    let plain_db = actor.fill_db_with_random_shares()?;
 
     tracing::info!("Actor {} initialized and ready", party_index);
 
     tokio::spawn(async move {
         for i in 0..100 {
-            let query = Vector::default();
-            let mut rng = StdRng::seed_from_u64(42);
-            let shares = query.secret_share(&mut rng);
+            let mut rng = StdRng::seed_from_u64(i as u64);
+            let vector = Vector::random(&mut rng);
+            let shares = vector.secret_share(&mut rng);
 
-            if let Err(e) = sender.send(ActorCommand::Comparison(shares[party_index].clone())) {
+            if let Err(e) = command_sender.send(ActorCommand::Comparison {
+                index: i,
+                vector: shares[party_index].clone(),
+            }) {
                 tracing::error!("Failed to send comparison command {}: {}", i, e);
                 break;
             }
@@ -534,7 +562,28 @@ async fn run(
         }
     });
 
-    // TODO: receive results
+    // Spawn task to receive and process results
+    tokio::spawn(async move {
+        while let Some((index, results)) = results_receiver.recv().await {
+            // Reconstruct the query vector for this request
+            let query_vector = Vector::random(&mut StdRng::seed_from_u64(index as u64));
+
+            for (db_index, &is_less_equal) in results.iter().enumerate() {
+                let dot_product = plain_db[db_index].dot(&query_vector);
+                let expected = dot_product < THRESHOLD as i16;
+                if is_less_equal != expected {
+                    tracing::error!(
+                        "Mismatch on request {}, db index {}: expected {}, got {}",
+                        index,
+                        db_index,
+                        expected,
+                        is_less_equal
+                    );
+                }
+            }
+        }
+        tracing::info!("Results receiver closed");
+    });
 
     tracing::info!("Waiting for network connections and processing commands...");
 
@@ -545,20 +594,11 @@ async fn run(
 mod tests {
     use crate::{Vector, udot};
 
-    fn dot_ref(a: &[i8], b: &[i8]) -> i16 {
-        a.iter()
-            .zip(b.iter())
-            .map(|(&a, &b)| a as i16 * b as i16)
-            .sum::<i16>()
-    }
-
     #[tokio::test]
     async fn test_galois_dot() {
         let mut rng = rand::thread_rng();
         let v1 = Vector::random(&mut rng);
         let v2 = Vector::random(&mut rng);
-
-        let dot_ref = dot_ref(&v1.0, &v2.0) as u16;
 
         let mut sv1 = v1.secret_share(&mut rand::thread_rng());
         let sv2 = v2.secret_share(&mut rand::thread_rng());
@@ -569,6 +609,6 @@ mod tests {
             dot = u16::wrapping_add(dot, udot(&sv1[i].0, &sv2[i].0));
         }
 
-        assert_eq!(dot, dot_ref);
+        assert_eq!(dot, v1.dot(&v2) as u16);
     }
 }
