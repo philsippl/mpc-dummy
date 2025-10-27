@@ -1,6 +1,6 @@
 use clap::Parser;
 use deadpool::unmanaged::Pool;
-use eyre::Context;
+use eyre::{Context, ContextCompat};
 use hdrhistogram::Histogram;
 use iris_mpc_common::galois::degree4::{GaloisRingElement, ShamirGaloisRingShare, basis};
 use iris_mpc_cpu::{
@@ -63,6 +63,9 @@ struct Cli {
 #[derive(Clone)]
 struct SecretSharedVector([u16; VECTOR_SIZE]);
 
+#[derive(Clone)]
+struct Vector([i8; VECTOR_SIZE]);
+
 type SessionPool = Pool<Session>;
 
 struct Network {
@@ -97,31 +100,6 @@ impl SecretSharedVector {
         SecretSharedVector([0u16; VECTOR_SIZE])
     }
 
-    pub fn create_shares<R: CryptoRng + Rng>(vector: &[u8; VECTOR_SIZE], rng: &mut R) -> [Self; 3] {
-        let mut shares = [
-            SecretSharedVector::default(),
-            SecretSharedVector::default(),
-            SecretSharedVector::default(),
-        ];
-        for i in (0..VECTOR_SIZE).step_by(4) {
-            let element = GaloisRingElement::<basis::A>::from_coefs([
-                vector[i] as u16,
-                vector[i + 1] as u16,
-                vector[i + 2] as u16,
-                vector[i + 3] as u16,
-            ]);
-            let element = element.to_monomial();
-            let share = ShamirGaloisRingShare::encode_3_mat(&element.coefs, rng);
-            for j in 0..3 {
-                shares[j].0[i] = share[j].y.coefs[0];
-                shares[j].0[i + 1] = share[j].y.coefs[1];
-                shares[j].0[i + 2] = share[j].y.coefs[2];
-                shares[j].0[i + 3] = share[j].y.coefs[3];
-            }
-        }
-        shares
-    }
-
     pub fn multiply_lagrange_coeffs(&mut self, id: usize) {
         let lagrange_coeffs = ShamirGaloisRingShare::deg_2_lagrange_polys_at_zero();
         for i in (0..self.0.len()).step_by(4) {
@@ -139,6 +117,45 @@ impl SecretSharedVector {
             self.0[i + 2] = element.coefs[2];
             self.0[i + 3] = element.coefs[3];
         }
+    }
+}
+
+impl Vector {
+    fn default() -> Self {
+        Vector([0i8; VECTOR_SIZE])
+    }
+
+    fn random<R: CryptoRng + Rng>(rng: &mut R) -> Self {
+        let mut vec = [0i8; VECTOR_SIZE];
+        for element in &mut vec {
+            *element = rng.gen_range(-8..7) // int4 range
+        }
+        Vector(vec)
+    }
+
+    pub fn secret_share<R: CryptoRng + Rng>(&self, rng: &mut R) -> [SecretSharedVector; 3] {
+        let mut shares = [
+            SecretSharedVector::default(),
+            SecretSharedVector::default(),
+            SecretSharedVector::default(),
+        ];
+        for i in (0..VECTOR_SIZE).step_by(4) {
+            let element = GaloisRingElement::<basis::A>::from_coefs([
+                self.0[i] as u16,
+                self.0[i + 1] as u16,
+                self.0[i + 2] as u16,
+                self.0[i + 3] as u16,
+            ]);
+            let element = element.to_monomial();
+            let share = ShamirGaloisRingShare::encode_3_mat(&element.coefs, rng);
+            for j in 0..3 {
+                shares[j].0[i] = share[j].y.coefs[0];
+                shares[j].0[i + 1] = share[j].y.coefs[1];
+                shares[j].0[i + 2] = share[j].y.coefs[2];
+                shares[j].0[i + 3] = share[j].y.coefs[3];
+            }
+        }
+        shares
     }
 }
 
@@ -252,7 +269,7 @@ impl Actor {
         sessions_per_request: usize,
         max_db: usize,
     ) -> eyre::Result<Self> {
-        let db = Arc::new(vec![[1u16; VECTOR_SIZE]; max_db]);
+        let db = Arc::new(vec![[0u16; VECTOR_SIZE]; max_db]);
         let network = Network::new(
             party_index,
             addresses.clone(),
@@ -270,6 +287,17 @@ impl Actor {
             total_requests: 0,
             total_hist: Histogram::new(3).unwrap(),
         })
+    }
+
+    fn fill_db_with_random_shares(&mut self) -> eyre::Result<()> {
+        let db_mut = Arc::get_mut(&mut self.db).context("Failed to get mutable db reference")?;
+        for (index, vec) in db_mut.iter_mut().enumerate() {
+            let mut rng = StdRng::seed_from_u64(index as u64);
+            let vector = Vector::random(&mut rng);
+            let shares = vector.secret_share(&mut rng);
+            *vec = shares[self.party_index].0;
+        }
+        Ok(())
     }
 
     async fn run_comparison(&mut self, vector: SecretSharedVector) -> eyre::Result<()> {
@@ -486,13 +514,17 @@ async fn run(
     )
     .await?;
 
+    tracing::info!("Filling database with random shares...");
+
+    actor.fill_db_with_random_shares()?;
+
     tracing::info!("Actor {} initialized and ready", party_index);
 
     tokio::spawn(async move {
         for i in 0..100 {
-            let query = [1u8; VECTOR_SIZE];
+            let query = Vector::default();
             let mut rng = StdRng::seed_from_u64(42);
-            let shares = SecretSharedVector::create_shares(&query, &mut rng);
+            let shares = query.secret_share(&mut rng);
 
             if let Err(e) = sender.send(ActorCommand::Comparison(shares[party_index].clone())) {
                 tracing::error!("Failed to send comparison command {}: {}", i, e);
@@ -502,6 +534,8 @@ async fn run(
         }
     });
 
+    // TODO: receive results
+
     tracing::info!("Waiting for network connections and processing commands...");
 
     actor.run().await
@@ -509,24 +543,25 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use crate::{SecretSharedVector, VECTOR_SIZE, udot};
+    use crate::{Vector, udot};
 
-    fn udot_u8(a: &[u8], b: &[u8]) -> u16 {
+    fn dot_ref(a: &[i8], b: &[i8]) -> i16 {
         a.iter()
             .zip(b.iter())
-            .map(|(&a, &b)| u16::wrapping_mul(a as u16, b as u16))
-            .fold(0_u16, u16::wrapping_add)
+            .map(|(&a, &b)| a as i16 * b as i16)
+            .sum::<i16>()
     }
 
     #[tokio::test]
     async fn test_galois_dot() {
-        let v1 = [1u8; VECTOR_SIZE];
-        let v2 = [2u8; VECTOR_SIZE];
+        let mut rng = rand::thread_rng();
+        let v1 = Vector::random(&mut rng);
+        let v2 = Vector::random(&mut rng);
 
-        let dot_ref = udot_u8(&v1, &v2);
+        let dot_ref = dot_ref(&v1.0, &v2.0) as u16;
 
-        let mut sv1 = SecretSharedVector::create_shares(&v1, &mut rand::thread_rng());
-        let sv2 = SecretSharedVector::create_shares(&v2, &mut rand::thread_rng());
+        let mut sv1 = v1.secret_share(&mut rand::thread_rng());
+        let sv2 = v2.secret_share(&mut rand::thread_rng());
 
         let mut dot: u16 = 0;
         for i in 0..3 {
