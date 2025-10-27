@@ -126,10 +126,6 @@ impl SecretSharedVector {
 }
 
 impl Vector {
-    fn default() -> Self {
-        Vector([0i8; VECTOR_SIZE])
-    }
-
     fn random<R: CryptoRng + Rng>(rng: &mut R) -> Self {
         let mut vec = [0i8; VECTOR_SIZE];
         for element in &mut vec {
@@ -273,6 +269,7 @@ impl Actor {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn new(
         party_index: usize,
         addresses: Vec<String>,
