@@ -18,6 +18,7 @@ use iris_mpc_cpu::{
 };
 use itertools::Itertools;
 use rand::{CryptoRng, Rng, SeedableRng, rngs::StdRng};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
     cmp::{max, min},
     sync::Arc,
@@ -305,14 +306,24 @@ impl Actor {
 
     fn fill_db_with_random_shares(&mut self) -> eyre::Result<Vec<Vector>> {
         let db_mut = Arc::get_mut(&mut self.db).context("Failed to get mutable db reference")?;
+        let party_index = self.party_index;
+
+        let results: Vec<(usize, [u16; VECTOR_SIZE], Vector)> = (0..db_mut.len())
+            .into_par_iter()
+            .map(|index| {
+                let mut rng = StdRng::seed_from_u64(index as u64);
+                let vector = Vector::random(&mut rng);
+                let shares = vector.secret_share(&mut rng);
+                (index, shares[party_index].0, vector)
+            })
+            .collect();
+
         let mut vectors = Vec::with_capacity(db_mut.len());
-        for (index, vec) in db_mut.iter_mut().enumerate() {
-            let mut rng = StdRng::seed_from_u64(index as u64);
-            let vector = Vector::random(&mut rng);
-            let shares = vector.secret_share(&mut rng);
-            *vec = shares[self.party_index].0;
+        for (index, share, vector) in results {
+            db_mut[index] = share;
             vectors.push(vector);
         }
+
         Ok(vectors)
     }
 
