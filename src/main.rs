@@ -21,14 +21,12 @@ use rand::{CryptoRng, Rng, SeedableRng, rngs::StdRng};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
     cmp::{max, min},
+    panic,
     sync::Arc,
     time::Instant,
 };
 use tokio::time::sleep;
-use tokio::{
-    sync::mpsc,
-    task::{self, JoinSet},
-};
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 const VECTOR_SIZE: usize = 512;
@@ -393,16 +391,12 @@ impl Actor {
         for (chunk_id, (chunk_start, chunk_end)) in chunk_bounds.into_iter().enumerate() {
             let query = Arc::clone(&shared_vector);
             let db = Arc::clone(&db);
-            cpu_tasks.spawn(async move {
-                let handle = task::spawn_blocking(move || {
-                    let distances = db[chunk_start..chunk_end]
-                        .iter()
-                        .map(|db_vec| udot(&query.0, db_vec))
-                        .collect::<Vec<_>>();
-                    (chunk_id, distances)
-                });
-                let result = handle.await?;
-                eyre::Result::<_>::Ok(result)
+            cpu_tasks.spawn_blocking(move || {
+                let distances = db[chunk_start..chunk_end]
+                    .iter()
+                    .map(|db_vec| udot(&query.0, db_vec))
+                    .collect::<Vec<_>>();
+                (chunk_id, distances)
             });
         }
 
@@ -414,7 +408,7 @@ impl Actor {
             std::collections::HashMap::new();
 
         while let Some(task_result) = cpu_tasks.join_next().await {
-            let (chunk_id, distances) = task_result??;
+            let (chunk_id, distances) = task_result?;
 
             // Buffer this chunk
             buffered_chunks.insert(chunk_id, distances);
@@ -587,6 +581,7 @@ async fn run(
                         expected,
                         is_less_equal
                     );
+                    panic!("Result mismatch detected");
                 }
             }
         }
