@@ -1,0 +1,3 @@
+[2m2025-10-28T09:10:49.773440Z[0m [32m INFO[0m [2mvector_mpc_poc[0m[2m:[0m Running party 0 of 3
+[2m2025-10-28T09:10:49.773481Z[0m [32m INFO[0m [2mvector_mpc_poc[0m[2m:[0m Config: max_db=100000, connection_parallelism=1, request_parallelism=1, session_per_request=1
+[2m2025-10-28T09:10:49.782661Z[0m [32m INFO[0m [2miris_mpc_cpu::network::tcp[0m[2m:[0m Building NetworkHandle, without TLS, from config: TcpConfig { timeout_duration: 10s, num_sessions: 1, num_connections: 1 }

@@ -30,13 +30,14 @@ use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 const VECTOR_SIZE: usize = 512;
-const THRESHOLD: u16 = 1000;
+const THRESHOLD: u16 = 2000;
 
 // Defaults, can be overridden via CLI args or env vars
 const MAX_DB_SIZE: usize = 10_000_000;
 const SESSION_PER_REQUEST: usize = 4;
 const CONNECTION_PARALLELISM: usize = 1;
 const REQUEST_PARALLELISM: usize = 1;
+const CPU_TO_NETWORK_RATIO: usize = 4;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -57,6 +58,9 @@ struct Cli {
 
     #[arg(long, env = "REQUEST_PARALLELISM", default_value_t = REQUEST_PARALLELISM)]
     request_parallelism: usize,
+
+    #[arg(long, env = "CPU_TO_NETWORK_RATIO", default_value_t = CPU_TO_NETWORK_RATIO)]
+    cpu_to_network_ratio: usize,
 }
 
 #[derive(Clone)]
@@ -341,7 +345,10 @@ impl Actor {
             return Ok(());
         }
 
-        let chunk_size = max(1, db_len.div_ceil(num_network_workers * 4));
+        let chunk_size = max(
+            1,
+            db_len.div_ceil(num_network_workers * CPU_TO_NETWORK_RATIO),
+        );
         let chunk_bounds = (0..db_len)
             .step_by(chunk_size)
             .map(|start| (start, min(start + chunk_size, db_len)))
