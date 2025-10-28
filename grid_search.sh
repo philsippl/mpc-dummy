@@ -15,9 +15,9 @@ mkdir -p "$LOG_DIR"
 
 # Define parameter ranges for grid search
 # Adjust these ranges based on your system capabilities
-SESSION_PER_REQUEST_VALUES=(1 2 4 8)
-CONNECTION_PARALLELISM_VALUES=(1 2 4)
-REQUEST_PARALLELISM_VALUES=(1 2 4)
+SESSION_PER_REQUEST_VALUES=(2 4 8 16 32)
+CONNECTION_PARALLELISM_VALUES=(2 4 8 16 32)
+REQUEST_PARALLELISM_VALUES=(2 4 8 16 32)
 CPU_TO_NETWORK_RATIO_VALUES=(1 2 4 8)
 
 # Configuration for the MPC application
