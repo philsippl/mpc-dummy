@@ -10,10 +10,8 @@ use iris_mpc_cpu::{
         player::{Role, RoleAssignment},
         session::{NetworkSession, Session},
     },
-    network::tcp::{NetworkHandle, build_network_handle},
-    protocol::ops::{
-        galois_ring_to_rep3, lte_threshold_and_open_u16, setup_replicated_prf, sub_pub,
-    },
+    network::tcp::{NetworkHandle, NetworkHandleArgs, build_network_handle},
+    protocol::ops::{galois_ring_to_rep3, lt_zero_and_open_u16, setup_replicated_prf, sub_pub},
     shares::RingElement,
 };
 use itertools::Itertools;
@@ -180,7 +178,6 @@ impl Network {
             .enumerate()
             .map(|(index, id)| (Role::new(index), id.clone()))
             .collect();
-        let role_assignments = std::sync::Arc::new(role_assignments);
 
         // abuse the hawk args struct for now
         let args = HawkArgs {
@@ -203,28 +200,19 @@ impl Network {
 
         // TODO: encapsulate networking setup in a function
         let mut networking = build_network_handle(
-            &args,
+            NetworkHandleArgs {
+                party_index: args.party_index,
+                addresses: args.addresses.clone(),
+                connection_parallelism: args.connection_parallelism,
+                request_parallelism: args.request_parallelism,
+                sessions_per_request,
+                tls: None,
+            },
             cancellation_token.child_token(),
-            &identities,
-            sessions_per_request,
         )
         .await?;
 
-        let tcp_sessions = networking
-            .as_mut()
-            .make_sessions()
-            .await
-            .context("Making sessions")?;
-
-        let networking_sessions = tcp_sessions
-            .into_iter()
-            .map(|tcp_session| NetworkSession {
-                session_id: tcp_session.id(),
-                role_assignments: role_assignments.clone(),
-                networking: Box::new(tcp_session),
-                own_role: Role::new(party_index),
-            })
-            .collect_vec();
+        let networking_sessions = networking.make_network_sessions().await?;
 
         let mut sessions = Vec::new();
         // todo parallelize session setup
@@ -376,7 +364,7 @@ impl Actor {
                     });
 
                     let chunk_results =
-                        lte_threshold_and_open_u16(&mut session, &chunk_distances).await?;
+                        lt_zero_and_open_u16(&mut session, &chunk_distances).await?;
 
                     result_tx.send((chunk_id, chunk_results)).await?;
                 }
