@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iris-mpc-cpu = { git = "https://github.com/worldcoin/iris-mpc.git" }
+iris-mpc-cpu = { git = "https://github.com/worldcoin/iris-mpc.git", features = ["chacha_prf"] }
 iris-mpc-common = { git = "https://github.com/worldcoin/iris-mpc.git" }
 tokio-util = "0.7.16"
 tokio = { version = "1.36.0", features = ["full"] }
