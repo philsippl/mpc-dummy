@@ -156,49 +156,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
-
-[[package]]
-name = "asn1-rs"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56624a96882bb8c26d61312ae18cb45868e5a9992ea73c58e45c3101e56a1e60"
-dependencies = [
- "asn1-rs-derive",
- "asn1-rs-impl",
- "displaydoc",
- "nom",
- "num-traits",
- "rusticata-macros",
- "thiserror 2.0.17",
- "time",
-]
-
-[[package]]
-name = "asn1-rs-derive"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
- "synstructure",
-]
-
-[[package]]
-name = "asn1-rs-impl"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "assert-json-diff"
@@ -386,31 +353,6 @@ dependencies = [
  "http 0.2.12",
  "regex-lite",
  "tracing",
-]
-
-[[package]]
-name = "aws-sdk-rds"
-version = "1.112.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eb69d036cf2cb8e5fbcf23df1e984d0cfc424f0fe7c9ec5ac4271e9d676d05f"
-dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-sigv4",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-query",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-smithy-xml",
- "aws-types",
- "fastrand",
- "http 0.2.12",
- "regex-lite",
- "tracing",
- "url",
 ]
 
 [[package]]
@@ -979,6 +921,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3888aaa89e4b2a40fca9848e400f6a658a5a3978de7be858e209cafa8be9a4a0"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1216,6 +1171,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "constant_time_eq"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
+
+[[package]]
 name = "convert_case"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1425,12 +1386,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "data-encoding"
-version = "2.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
-
-[[package]]
 name = "deadpool"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1476,20 +1431,6 @@ dependencies = [
  "const-oid",
  "pem-rfc7468",
  "zeroize",
-]
-
-[[package]]
-name = "der-parser"
-version = "10.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07da5016415d5a3c4dd39b11ed26f915f52fc4e0dc197d87908bc916e51bc1a6"
-dependencies = [
- "asn1-rs",
- "displaydoc",
- "nom",
- "num-bigint",
- "num-traits",
- "rusticata-macros",
 ]
 
 [[package]]
@@ -2529,7 +2470,7 @@ dependencies = [
 [[package]]
 name = "iris-mpc-common"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=384ada05c4e471eaeac36573a691577ecdf10dbe#384ada05c4e471eaeac36573a691577ecdf10dbe"
+source = "git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef#de5f1ef9e0da5e8868e299b9bb6210b134dfb349"
 dependencies = [
  "aws-config",
  "aws-sdk-kms",
@@ -2544,9 +2485,6 @@ dependencies = [
  "chrono",
  "clap",
  "config",
- "data-encoding",
- "digest",
- "dotenvy",
  "eyre",
  "futures",
  "hex",
@@ -2561,7 +2499,57 @@ dependencies = [
  "rand 0.8.5",
  "rayon",
  "reqwest",
- "ring",
+ "serde",
+ "serde-big-array",
+ "serde_json",
+ "sha2",
+ "sodiumoxide",
+ "sqlx",
+ "telemetry-batteries",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "wiremock",
+ "zeroize",
+]
+
+[[package]]
+name = "iris-mpc-common"
+version = "0.1.0"
+source = "git+https://github.com/worldcoin/iris-mpc.git#8b242c67aea99f181f75088277a2ad8fd36ad25a"
+dependencies = [
+ "aws-config",
+ "aws-sdk-kms",
+ "aws-sdk-s3",
+ "aws-sdk-secretsmanager",
+ "aws-sdk-sns",
+ "aws-sdk-sqs",
+ "axum",
+ "base64 0.22.1",
+ "bincode",
+ "bytemuck",
+ "chrono",
+ "clap",
+ "config",
+ "eyre",
+ "futures",
+ "hex",
+ "hmac",
+ "http 1.3.1",
+ "itertools 0.13.0",
+ "metrics 0.22.4",
+ "metrics-exporter-statsd 0.7.0",
+ "num_cpus",
+ "percent-encoding",
+ "pprof",
+ "rand 0.8.5",
+ "rayon",
+ "reqwest",
  "serde",
  "serde-big-array",
  "serde_json",
@@ -2584,29 +2572,25 @@ dependencies = [
 [[package]]
 name = "iris-mpc-cpu"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=384ada05c4e471eaeac36573a691577ecdf10dbe#384ada05c4e471eaeac36573a691577ecdf10dbe"
+source = "git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef#de5f1ef9e0da5e8868e299b9bb6210b134dfb349"
 dependencies = [
  "aes-prng",
  "ansiterm",
- "anyhow",
  "async-channel",
- "async-stream",
  "async-trait",
- "aws-config",
- "aws-sdk-rds",
  "aws-sdk-s3",
  "backon",
  "bincode",
+ "blake3",
  "bytemuck",
  "bytes",
  "clap",
  "core_affinity",
  "crossbeam",
  "dashmap",
- "dotenvy",
  "eyre",
  "futures",
- "iris-mpc-common",
+ "iris-mpc-common 0.1.0 (git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef)",
  "iris-mpc-store",
  "itertools 0.13.0",
  "metrics 0.22.4",
@@ -2616,15 +2600,13 @@ dependencies = [
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rand_distr",
+ "rayon",
  "rstest",
- "rustls 0.21.12",
- "rustls-native-certs 0.8.2",
  "serde",
  "serde_json",
  "siphasher",
  "socket2 0.6.1",
  "sqlx",
- "static_assertions",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -2636,14 +2618,12 @@ dependencies = [
  "tracing-forest",
  "tracing-subscriber",
  "tracing-test",
- "uuid",
- "x509-parser",
 ]
 
 [[package]]
 name = "iris-mpc-store"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=384ada05c4e471eaeac36573a691577ecdf10dbe#384ada05c4e471eaeac36573a691577ecdf10dbe"
+source = "git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef#de5f1ef9e0da5e8868e299b9bb6210b134dfb349"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2652,7 +2632,7 @@ dependencies = [
  "dotenvy",
  "eyre",
  "futures",
- "iris-mpc-common",
+ "iris-mpc-common 0.1.0 (git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef)",
  "itertools 0.13.0",
  "rand 0.8.5",
  "sqlx",
@@ -3055,16 +3035,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-bigint"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
-dependencies = [
- "num-integer",
- "num-traits",
-]
-
-[[package]]
 name = "num-bigint-dig"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3166,15 +3136,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "oid-registry"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
-dependencies = [
- "asn1-rs",
 ]
 
 [[package]]
@@ -4101,15 +4062,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusticata-macros"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
-dependencies = [
- "nom",
-]
-
-[[package]]
 name = "rustix"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4762,12 +4714,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "str_stack"
@@ -5562,7 +5508,7 @@ dependencies = [
  "dotenvy",
  "eyre",
  "hdrhistogram",
- "iris-mpc-common",
+ "iris-mpc-common 0.1.0 (git+https://github.com/worldcoin/iris-mpc.git)",
  "iris-mpc-cpu",
  "itertools 0.14.0",
  "num_cpus",
@@ -6118,23 +6064,6 @@ name = "writeable"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea2f10b9bb0928dfb1b42b65e1f9e36f7f54dbdf08457afefb38afcdec4fa2bb"
-
-[[package]]
-name = "x509-parser"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4569f339c0c402346d4a75a9e39cf8dad310e287eef1ff56d4c68e5067f53460"
-dependencies = [
- "asn1-rs",
- "data-encoding",
- "der-parser",
- "lazy_static",
- "nom",
- "oid-registry",
- "rusticata-macros",
- "thiserror 2.0.17",
- "time",
-]
 
 [[package]]
 name = "xmlparser"

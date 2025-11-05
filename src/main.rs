@@ -172,28 +172,14 @@ impl Network {
         request_parallelism: usize,
         sessions_per_request: usize,
     ) -> eyre::Result<Network> {
-        let identities = generate_local_identities();
-        let role_assignments: RoleAssignment = identities
-            .iter()
-            .enumerate()
-            .map(|(index, id)| (Role::new(index), id.clone()))
-            .collect();
-
         // abuse the hawk args struct for now
-        let args = HawkArgs {
-            party_index,
-            addresses,
-            request_parallelism,
+        let args = NetworkHandleArgs {
+            party_index: party_index,
+            addresses: addresses.clone(),
             connection_parallelism,
-            hnsw_param_M: 0,
-            hnsw_param_ef_search: 0,
-            hnsw_param_ef_constr: 0,
-            disable_persistence: false,
-            hnsw_prf_key: None,
+            request_parallelism,
+            sessions_per_request,
             tls: None,
-            n_buckets: 0,
-            match_distances_buffer_size: 0,
-            numa: false,
         };
 
         let cancellation_token = CancellationToken::new();
