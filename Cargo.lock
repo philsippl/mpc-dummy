@@ -2470,57 +2470,6 @@ dependencies = [
 [[package]]
 name = "iris-mpc-common"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef#de5f1ef9e0da5e8868e299b9bb6210b134dfb349"
-dependencies = [
- "aws-config",
- "aws-sdk-kms",
- "aws-sdk-s3",
- "aws-sdk-secretsmanager",
- "aws-sdk-sns",
- "aws-sdk-sqs",
- "axum",
- "base64 0.22.1",
- "bincode",
- "bytemuck",
- "chrono",
- "clap",
- "config",
- "eyre",
- "futures",
- "hex",
- "hmac",
- "http 1.3.1",
- "itertools 0.13.0",
- "metrics 0.22.4",
- "metrics-exporter-statsd 0.7.0",
- "num_cpus",
- "percent-encoding",
- "pprof",
- "rand 0.8.5",
- "rayon",
- "reqwest",
- "serde",
- "serde-big-array",
- "serde_json",
- "sha2",
- "sodiumoxide",
- "sqlx",
- "telemetry-batteries",
- "thiserror 1.0.69",
- "time",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "wiremock",
- "zeroize",
-]
-
-[[package]]
-name = "iris-mpc-common"
-version = "0.1.0"
 source = "git+https://github.com/worldcoin/iris-mpc.git#b6f9794070e57b1d9c8c8978f8dfb1921a6068a4"
 dependencies = [
  "aws-config",
@@ -2572,7 +2521,7 @@ dependencies = [
 [[package]]
 name = "iris-mpc-cpu"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef#de5f1ef9e0da5e8868e299b9bb6210b134dfb349"
+source = "git+https://github.com/worldcoin/iris-mpc.git#8b242c67aea99f181f75088277a2ad8fd36ad25a"
 dependencies = [
  "aes-prng",
  "ansiterm",
@@ -2590,7 +2539,7 @@ dependencies = [
  "dashmap",
  "eyre",
  "futures",
- "iris-mpc-common 0.1.0 (git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef)",
+ "iris-mpc-common",
  "iris-mpc-store",
  "itertools 0.13.0",
  "metrics 0.22.4",
@@ -2623,7 +2572,7 @@ dependencies = [
 [[package]]
 name = "iris-mpc-store"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef#de5f1ef9e0da5e8868e299b9bb6210b134dfb349"
+source = "git+https://github.com/worldcoin/iris-mpc.git#8b242c67aea99f181f75088277a2ad8fd36ad25a"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2632,7 +2581,7 @@ dependencies = [
  "dotenvy",
  "eyre",
  "futures",
- "iris-mpc-common 0.1.0 (git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef)",
+ "iris-mpc-common",
  "itertools 0.13.0",
  "rand 0.8.5",
  "sqlx",
@@ -5508,7 +5457,7 @@ dependencies = [
  "dotenvy",
  "eyre",
  "hdrhistogram",
- "iris-mpc-common 0.1.0 (git+https://github.com/worldcoin/iris-mpc.git)",
+ "iris-mpc-common",
  "iris-mpc-cpu",
  "itertools 0.14.0",
  "num_cpus",
