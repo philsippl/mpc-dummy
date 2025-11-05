@@ -2470,7 +2470,7 @@ dependencies = [
 [[package]]
 name = "iris-mpc-common"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef#de5f1ef9e0da5e8868e299b9bb6210b134dfb349"
+source = "git+https://github.com/worldcoin/iris-mpc.git?rev=cfc254e#cfc254ee13c87ec300a28d72f3cf2489f89d2d9b"
 dependencies = [
  "aws-config",
  "aws-sdk-kms",
@@ -2572,7 +2572,7 @@ dependencies = [
 [[package]]
 name = "iris-mpc-cpu"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef#de5f1ef9e0da5e8868e299b9bb6210b134dfb349"
+source = "git+https://github.com/worldcoin/iris-mpc.git?rev=cfc254e#cfc254ee13c87ec300a28d72f3cf2489f89d2d9b"
 dependencies = [
  "aes-prng",
  "ansiterm",
@@ -2590,7 +2590,7 @@ dependencies = [
  "dashmap",
  "eyre",
  "futures",
- "iris-mpc-common 0.1.0 (git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef)",
+ "iris-mpc-common 0.1.0 (git+https://github.com/worldcoin/iris-mpc.git?rev=cfc254e)",
  "iris-mpc-store",
  "itertools 0.13.0",
  "metrics 0.22.4",
@@ -2623,7 +2623,7 @@ dependencies = [
 [[package]]
 name = "iris-mpc-store"
 version = "0.1.0"
-source = "git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef#de5f1ef9e0da5e8868e299b9bb6210b134dfb349"
+source = "git+https://github.com/worldcoin/iris-mpc.git?rev=cfc254e#cfc254ee13c87ec300a28d72f3cf2489f89d2d9b"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2632,7 +2632,7 @@ dependencies = [
  "dotenvy",
  "eyre",
  "futures",
- "iris-mpc-common 0.1.0 (git+https://github.com/worldcoin/iris-mpc.git?rev=de5f1ef)",
+ "iris-mpc-common 0.1.0 (git+https://github.com/worldcoin/iris-mpc.git?rev=cfc254e)",
  "itertools 0.13.0",
  "rand 0.8.5",
  "sqlx",

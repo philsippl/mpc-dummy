@@ -1,15 +1,10 @@
 use clap::Parser;
 use deadpool::unmanaged::Pool;
-use eyre::{Context, ContextCompat};
+use eyre::ContextCompat;
 use hdrhistogram::Histogram;
 use iris_mpc_common::galois::degree4::{GaloisRingElement, ShamirGaloisRingShare, basis};
 use iris_mpc_cpu::{
-    execution::{
-        hawk_main::HawkArgs,
-        local::generate_local_identities,
-        player::{Role, RoleAssignment},
-        session::{NetworkSession, Session},
-    },
+    execution::session::Session,
     network::tcp::{NetworkHandle, NetworkHandleArgs, build_network_handle},
     protocol::ops::{galois_ring_to_rep3, lt_zero_and_open_u16, setup_replicated_prf, sub_pub},
     shares::RingElement,
@@ -172,7 +167,6 @@ impl Network {
         request_parallelism: usize,
         sessions_per_request: usize,
     ) -> eyre::Result<Network> {
-        // abuse the hawk args struct for now
         let args = NetworkHandleArgs {
             party_index: party_index,
             addresses: addresses.clone(),
