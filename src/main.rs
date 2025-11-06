@@ -516,7 +516,7 @@ async fn run(
     tracing::info!("Actor {} initialized and ready", party_index);
 
     tokio::spawn(async move {
-        for i in 0..100 {
+        for i in 0..1000 {
             let mut rng = StdRng::seed_from_u64(i as u64);
             let vector = Vector::random(&mut rng);
             let shares = vector.secret_share(&mut rng);
